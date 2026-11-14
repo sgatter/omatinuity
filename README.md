@@ -7,6 +7,17 @@ send the clipboard, copied files or the latest screenshot to the phone.
 Built to the Omarchy plugin contract (<https://plugins.omarchy.org/develop.html>): one
 `bar-widget` kind, `BarWidget.qml` as the entry point, and `Panel.qml` loaded by it.
 
+<p align="center">
+  <img src="preview.png" width="900" alt="The Omatinuity panel: an incoming call above the message list, a conversation, recent calls and a contact search">
+</p>
+
+Single views: [overview](screenshots/overview.png) ·
+[conversation](screenshots/conversation.png) ·
+[incoming call](screenshots/incoming-call.png) ·
+[recent calls](screenshots/recent-calls.png) ·
+[contact search](screenshots/contacts.png).
+The people, numbers and messages in the pictures are made up.
+
 ## Files
 
 ```
@@ -18,6 +29,8 @@ io.github.sgatter.omatinuity/
 ├── backend.py           talks to tetherd over $XDG_RUNTIME_DIR/tether/tetherd.sock
 ├── bin/tether-gtk       notification-click redirect (see below)
 ├── setup-bluetooth.sh   one-time Bluetooth setup for messages and calls
+├── preview.png          picture for this page and the marketplace listing
+├── screenshots/         the single views it is made of
 └── tests/               regression tests for the rules under Security
 ```
 
