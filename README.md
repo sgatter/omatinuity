@@ -35,7 +35,7 @@ io.github.sgatter.omatether/
 yay -S tether
 systemctl --user enable --now tetherd.service
 sudo ufw allow 5134/tcp && sudo ufw allow 5353/udp
-omarchy plugin add https://github.com/sgatter/omateather.git --enable
+omarchy plugin add https://github.com/sgatter/omatether.git --enable
 ```
 
 Then open the Tether app on the iPhone and accept the pairing request from the panel.
