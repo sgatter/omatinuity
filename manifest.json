@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "id": "io.github.sgatter.omatether",
-  "name": "Omatether",
+  "id": "io.github.sgatter.omatinuity",
+  "name": "Omatinuity",
   "version": "1.0.0",
   "author": "sven",
   "license": "MIT",
@@ -13,7 +13,7 @@
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
-    "displayName": "Omatether",
+    "displayName": "Omatinuity",
     "description": "Read and reply to iPhone messages, answer and place calls, accept pairing requests, and send files or the clipboard to the phone.",
     "category": "Devices",
     "aliases": [

@@ -135,7 +135,7 @@ Item {
   // event. A shared non-blocking lock lets only the first copy notify; it is
   // held a few seconds (or, for a call, until the notification is answered).
   function onceCommand(key, args, holdSeconds) {
-    var lock = (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/io.github.sgatter.omatether-" + String(key).replace(/[^A-Za-z0-9]+/g, "_") + ".lock"
+    var lock = (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/io.github.sgatter.omatinuity-" + String(key).replace(/[^A-Za-z0-9]+/g, "_") + ".lock"
     // -o: only flock holds the lock, so stopping it (call ended) frees it.
     return ["flock", "-n", "-o", lock, "sh", "-c", '"$@"; s=$?; sleep ' + holdSeconds + '; exit $s', "sh"].concat(args)
   }

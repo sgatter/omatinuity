@@ -9,7 +9,7 @@ import qs.Ui
 
 Panel {
   id: root
-  moduleName: "io.github.sgatter.omatether"
+  moduleName: "io.github.sgatter.omatinuity"
   manageIpc: false
 
   // Injected by BarWidget.qml, which owns the button, the Tether service and

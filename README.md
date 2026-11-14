@@ -1,4 +1,4 @@
-# Omatether
+# Omatinuity
 
 A bar widget for [Tether](https://github.com/zackb/tether), iPhone ↔ Linux continuity in the
 Omarchy bar: read and reply to messages, answer and place calls, accept pairing requests, and
@@ -10,7 +10,7 @@ Built to the Omarchy plugin contract (<https://plugins.omarchy.org/develop.html>
 ## Files
 
 ```
-io.github.sgatter.omatether/
+io.github.sgatter.omatinuity/
 ├── manifest.json        bar-widget, entry point BarWidget.qml
 ├── BarWidget.qml        bar icon, Tether service, panel lifecycle, shell IPC
 ├── Panel.qml            details panel (KeyboardPanel, keyboard navigation)
@@ -35,14 +35,14 @@ io.github.sgatter.omatether/
 yay -S tether
 systemctl --user enable --now tetherd.service
 sudo ufw allow 5134/tcp && sudo ufw allow 5353/udp
-omarchy plugin add https://github.com/sgatter/omatether.git --enable
+omarchy plugin add https://github.com/sgatter/omatinuity.git --enable
 ```
 
 Then open the Tether app on the iPhone and accept the pairing request from the panel.
 
 ### Messages and calls (Bluetooth)
 
-Run `~/.config/omarchy/plugins/io.github.sgatter.omatether/setup-bluetooth.sh` once (or
+Run `~/.config/omarchy/plugins/io.github.sgatter.omatinuity/setup-bluetooth.sh` once (or
 "Set up Bluetooth" in the panel). It:
 
 1. runs `bluetoothd --experimental` (`/etc/systemd/system/bluetooth.service.d/experimental.conf`,
@@ -64,13 +64,13 @@ panel instead, put this plugin's `bin/` first on tetherd's PATH (and only tether
 mkdir -p ~/.config/systemd/user/tetherd.service.d
 cat > ~/.config/systemd/user/tetherd.service.d/omarchy-panel.conf <<'EOF'
 [Service]
-Environment=PATH=%h/.config/omarchy/plugins/io.github.sgatter.omatether/bin:/usr/share/omarchy/bin:/usr/local/sbin:/usr/local/bin:/usr/bin
+Environment=PATH=%h/.config/omarchy/plugins/io.github.sgatter.omatinuity/bin:/usr/share/omarchy/bin:/usr/local/sbin:/usr/local/bin:/usr/bin
 EOF
 systemctl --user daemon-reload && systemctl --user restart tetherd
 ```
 
 tetherd launches `tether-gtk --thread=<key>` for a click; `bin/tether-gtk` turns that into
-`omarchy-shell io.github.sgatter.omatether openThread <key>` and passes anything else to
+`omarchy-shell io.github.sgatter.omatinuity openThread <key>` and passes anything else to
 `/usr/bin/tether-gtk`.
 
 ## Usage
@@ -85,7 +85,7 @@ The bar draws one copy per monitor; call and pairing notifications are shown onc
 ## Configure
 
 ```sh
-omarchy bar move io.github.sgatter.omatether --after omarchy.tray
+omarchy bar move io.github.sgatter.omatinuity --after omarchy.tray
 ```
 
 Settings (inline on the widget's entry in `~/.config/omarchy/shell.json`):
@@ -94,31 +94,31 @@ Settings (inline on the widget's entry in `~/.config/omarchy/shell.json`):
 ## Shell commands
 
 ```sh
-omarchy-shell shell summon io.github.sgatter.omatether '{}'
-omarchy-shell shell hide io.github.sgatter.omatether
-omarchy-shell io.github.sgatter.omatether sendClipboard
-omarchy-shell io.github.sgatter.omatether sendScreenshot
-omarchy-shell io.github.sgatter.omatether send /path/to/file
-omarchy-shell io.github.sgatter.omatether answer
-omarchy-shell io.github.sgatter.omatether hangup
-omarchy-shell io.github.sgatter.omatether dial +15551234567
-omarchy-shell io.github.sgatter.omatether dialer       # open the call-or-message picker
-omarchy-shell io.github.sgatter.omatether openLatest   # open the most recent conversation
+omarchy-shell shell summon io.github.sgatter.omatinuity '{}'
+omarchy-shell shell hide io.github.sgatter.omatinuity
+omarchy-shell io.github.sgatter.omatinuity sendClipboard
+omarchy-shell io.github.sgatter.omatinuity sendScreenshot
+omarchy-shell io.github.sgatter.omatinuity send /path/to/file
+omarchy-shell io.github.sgatter.omatinuity answer
+omarchy-shell io.github.sgatter.omatinuity hangup
+omarchy-shell io.github.sgatter.omatinuity dial +15551234567
+omarchy-shell io.github.sgatter.omatinuity dialer       # open the call-or-message picker
+omarchy-shell io.github.sgatter.omatinuity openLatest   # open the most recent conversation
 ```
 
 Example in `~/.config/hypr/bindings.lua`:
-`o.bind("SUPER + ALT + I", "Send screenshot to iPhone", "omarchy-shell io.github.sgatter.omatether sendScreenshot")`
+`o.bind("SUPER + ALT + I", "Send screenshot to iPhone", "omarchy-shell io.github.sgatter.omatinuity sendScreenshot")`
 
 ## Update
 
 ```sh
-omarchy plugin update io.github.sgatter.omatether
+omarchy plugin update io.github.sgatter.omatinuity
 ```
 
 ## Remove
 
 ```sh
-omarchy plugin remove io.github.sgatter.omatether
+omarchy plugin remove io.github.sgatter.omatinuity
 rm -f ~/.config/systemd/user/tetherd.service.d/omarchy-panel.conf
 systemctl --user daemon-reload && systemctl --user restart tetherd
 ```
@@ -136,6 +136,6 @@ sudo systemctl daemon-reload && sudo systemctl restart bluetooth
 ## Validate
 
 ```sh
-omarchy plugin validate ~/.config/omarchy/plugins/io.github.sgatter.omatether
+omarchy plugin validate ~/.config/omarchy/plugins/io.github.sgatter.omatinuity
 qmllint -I "$OMARCHY_PATH/shell" BarWidget.qml Panel.qml
 ```

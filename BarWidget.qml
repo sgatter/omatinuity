@@ -6,10 +6,10 @@ import qs.Ui
 // Bar entry point: the phone icon, the Tether service, and the shell IPC.
 // Panel.qml is loaded here and receives the service, so the icon and the
 // panel always read the same state. open/close/opened are forwarded so
-// `omarchy-shell shell summon|hide io.github.sgatter.omatether` reach the panel.
+// `omarchy-shell shell summon|hide io.github.sgatter.omatinuity` reach the panel.
 BarWidget {
   id: root
-  moduleName: "io.github.sgatter.omatether"
+  moduleName: "io.github.sgatter.omatinuity"
 
   readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
   readonly property bool popoutSwitchClosing: panelLoader.item ? panelLoader.item.popoutSwitchClosing === true : false
