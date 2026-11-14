@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.sgatter.omatether",
+  "name": "Omatether",
+  "version": "1.0.0",
+  "author": "sven",
+  "license": "MIT",
+  "description": "iPhone continuity in the Omarchy bar via Tether: messages and replies, calls, contacts, pairing, and sending files and clipboard to the phone.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Omatether",
+    "description": "Read and reply to iPhone messages, answer and place calls, accept pairing requests, and send files or the clipboard to the phone.",
+    "category": "Devices",
+    "aliases": [
+      "iphone",
+      "continuity",
+      "airdrop",
+      "phone",
+      "ios"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 10,
+      "notifyPairing": true
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 3,
+        "max": 600,
+        "step": 1,
+        "defaultValue": 10
+      },
+      {
+        "key": "notifyPairing",
+        "type": "boolean",
+        "label": "Notify when a device asks to pair",
+        "defaultValue": true
+      }
+    ]
+  }
+}

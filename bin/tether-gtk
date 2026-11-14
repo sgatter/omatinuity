@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Stand-in for tether-gtk on tetherd's PATH only (see the drop-in
+# ~/.config/systemd/user/tetherd.service.d/omarchy-panel.conf). Clicking a message
+# notification, or its Reply button, makes tetherd run
+# `tether-gtk --thread=<key>`; open that conversation in the Omarchy panel
+# instead. Anything else, or a shell that cannot take it, goes to the real app.
+
+for arg in "$@"; do
+  case "$arg" in
+    --thread=*)
+      thread="${arg#--thread=}"
+      if [[ -n $thread ]] && omarchy-shell io.github.sgatter.omatether openThread "$thread" 2>/dev/null | grep -qx ok; then
+        exit 0
+      fi
+      ;;
+  esac
+done
+
+exec /usr/bin/tether-gtk "$@"
