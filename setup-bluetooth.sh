@@ -6,6 +6,17 @@ set -euo pipefail
 
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 
+say "This changes Bluetooth on this machine:"
+cat <<'EOF'
+  1. bluetoothd runs with --experimental (sudo; restarts Bluetooth)
+  2. tether-btclass@hci0 presents the adapter as A/V Hands-Free (sudo)
+  3. ~/.config/wireplumber/wireplumber.conf.d/tether-no-hfp-hf.conf keeps
+     PipeWire off the iPhone's hands-free link (restarts WirePlumber)
+  4. tetherd call control is turned on
+EOF
+read -r -p "Continue? [y/N] " answer
+[[ $answer == [yY]* ]] || { echo "Nothing changed."; exit 0; }
+
 say "1/4  bluetoothd --experimental (LE bearer for notifications, Telephony for calls)"
 echo "     Restarts Bluetooth: connected headphones drop for a few seconds."
 sudo mkdir -p /etc/systemd/system/bluetooth.service.d
