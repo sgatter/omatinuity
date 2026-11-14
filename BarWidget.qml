@@ -92,7 +92,7 @@ BarWidget {
       if (panelLoader.item) panelLoader.item.openDialer()
     }
     function openThread(thread: string): string {
-      if (thread === "" || !panelLoader.item) return "no thread"
+      if (!tether.validThread(thread) || !panelLoader.item) return "no thread"
       var info = tether.threadFor(thread)
       root.open()
       panelLoader.item.openConversation(thread, info ? info.name : thread.replace(/^tel:/, ""))

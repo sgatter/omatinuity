@@ -3,21 +3,150 @@
 # using the daemon's newline-delimited JSON protocol, and prints one JSON object
 # for the widget. Never starts the daemon on its own: a status poll must not
 # resurrect a tetherd the user just stopped.
+#
+# Two rules hold throughout:
+#   - Nothing private is ever an argument. Message text, numbers, names and
+#     paths arrive as one JSON request on stdin and leave over the daemon's
+#     socket or the session bus, because /proc/<pid>/cmdline is readable by
+#     other local accounts.
+#   - Everything the phone sends is untrusted. It is type-checked, bounded and
+#     stripped of control characters before the widget sees it.
+import fcntl
+import hashlib
+import html
 import json
 import os
+import re
+import signal
 import socket
+import stat
+import struct
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.parse
 
+PLUGIN_ID = "io.github.sgatter.omatinuity"
 
-def runtime_dir():
-    base = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
-    return os.path.join(base, "tether")
+MAX_REQUEST = 256 * 1024        # one request on stdin
+MAX_BUFFER = 4 * 1024 * 1024    # unread daemon output held at once
+MAX_NAME = 120
+MAX_NUMBER = 64
+MAX_KEY = 256                   # thread keys, message handles, addresses
+MAX_BODY = 8000                 # a message as shown
+MAX_REPLY = 5000                # a message as sent
+MAX_PREVIEW = 200
+MAX_NOTE = 300                  # reasons and results from the daemon
+MAX_PATH = 4096
+MAX_CLIPBOARD = 1024 * 1024
+MAX_TIME = 2 ** 40
+MAX_FILES = 64
+
+# Overrides, embeddings and isolates can make text read as something it is
+# not, and iOS wraps phone numbers in embedding marks.
+BIDI_CONTROLS = frozenset(range(0x202A, 0x202F)) | frozenset(range(0x2066, 0x206A))
+BIDI_OVERRIDES = frozenset((0x202D, 0x202E))
+
+DIALABLE = re.compile(r"^[0-9+*#,;().\- pPwW]{1,40}$")
+CALL_PATH = re.compile(r"^/[A-Za-z0-9_/]{1,254}$")
+FINGERPRINT = re.compile(r"^[A-Za-z0-9:+/=_-]{8,128}$")
 
 
-SOCKET_PATH = os.path.join(runtime_dir(), "tetherd.sock")
+def clean(value, limit, multiline=False):
+    """Untrusted text made safe to show: a str of at most `limit` characters
+    with no control characters. One line unless `multiline`."""
+    if not isinstance(value, str):
+        if value is None or isinstance(value, (bool, dict, list)):
+            return ""
+        value = str(value)
+    out = []
+    for ch in value[:limit * 4]:
+        code = ord(ch)
+        if ch in "\r\n  ":
+            out.append("\n" if multiline else " ")
+        elif ch == "\t":
+            out.append(" ")
+        elif unicodedata.category(ch) in ("Cc", "Cs"):
+            continue
+        elif code in (BIDI_OVERRIDES if multiline else BIDI_CONTROLS):
+            continue
+        else:
+            out.append(ch)
+    text = "".join(out)
+    if multiline:
+        text = text.replace("\n\n\n", "\n\n")
+    return text[:limit].strip() if not multiline else text[:limit]
+
+
+def ident(value, limit=MAX_KEY):
+    """An identifier handed back to the daemon unchanged (thread key, message
+    handle, address), or '' when it is not one."""
+    if not isinstance(value, str) or not 0 < len(value) <= limit:
+        return ""
+    if any(unicodedata.category(ch) in ("Cc", "Cs") for ch in value):
+        return ""
+    return value
+
+
+def count(value, high=2 ** 53):
+    """An untrusted number as an int in 0..high."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return max(0, min(high, n))
+
+
+def rows(value, limit):
+    """Up to `limit` objects from an untrusted list."""
+    if not isinstance(value, list):
+        return []
+    return [v for v in value[:limit] if isinstance(v, dict)]
+
+
+def want_thread(value):
+    thread = ident(value)
+    if not thread:
+        raise ValueError("Not a conversation")
+    return thread
+
+
+def want_number(value):
+    number = clean(value, MAX_NUMBER) if isinstance(value, str) else ""
+    if not DIALABLE.match(number):
+        raise ValueError("Not a phone number")
+    return number
+
+
+def want_call_path(value, required=False):
+    if value in (None, "") and not required:
+        return ""
+    if not isinstance(value, str) or not CALL_PATH.match(value):
+        raise ValueError("Not a call")
+    return value
+
+
+def want_fingerprint(value):
+    if not isinstance(value, str) or not FINGERPRINT.match(value):
+        raise ValueError("Not a device")
+    return value
+
+
+def want_paths(value):
+    if not isinstance(value, list) or not 0 < len(value) <= MAX_FILES:
+        raise ValueError("Nothing to send")
+    for p in value:
+        if not isinstance(p, str) or not 0 < len(p) <= MAX_PATH or "\0" in p:
+            raise ValueError("Not a file path")
+    return value
+
+
+def runtime_base():
+    return os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+
+
+SOCKET_PATH = os.path.join(runtime_base(), "tether", "tetherd.sock")
 
 
 class Daemon:
@@ -26,6 +155,11 @@ class Daemon:
         self.sock.settimeout(timeout)
         self.sock.connect(SOCKET_PATH)
         self.buf = b""
+        # Only ever this user's own daemon, whatever the path points at.
+        creds = self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        if struct.unpack("3i", creds)[1] != os.getuid():
+            self.close()
+            raise OSError("tetherd socket belongs to another user")
 
     def close(self):
         try:
@@ -33,11 +167,24 @@ class Daemon:
         except OSError:
             pass
 
+    def send(self, payload):
+        self.sock.sendall((json.dumps(payload) + "\n").encode())
+
+    def fill(self):
+        """Read more from the daemon; False at end of stream."""
+        chunk = self.sock.recv(65536)
+        if not chunk:
+            return False
+        self.buf += chunk
+        if len(self.buf) > MAX_BUFFER:
+            raise OSError("Reply from tetherd is too large")
+        return True
+
     def request(self, payload, want=None, deadline=3.0):
         """Send one command and return the first JSON reply whose command is in
         `want` (any JSON object when `want` is None). Stray broadcasts and the
         daemon's plain `OK` acks are skipped."""
-        self.sock.sendall((json.dumps(payload) + "\n").encode())
+        self.send(payload)
         end = time.monotonic() + deadline
         while time.monotonic() < end:
             while b"\n" in self.buf:
@@ -55,11 +202,7 @@ class Daemon:
                     continue
                 if want is None or obj.get("command") in want:
                     return obj
-            chunk = self.sock.recv(65536)
-            if not chunk:
-                break
-            self.buf += chunk
-            if len(self.buf) > 4 * 1024 * 1024:
+            if not self.fill():
                 break
         raise TimeoutError("No reply to %s" % payload.get("command"))
 
@@ -74,12 +217,10 @@ class Daemon:
                     continue
                 return obj if isinstance(obj, dict) else None
             try:
-                chunk = self.sock.recv(65536)
+                if not self.fill():
+                    return None
             except socket.timeout:
                 return None
-            if not chunk:
-                return None
-            self.buf += chunk
         return None
 
 
@@ -89,7 +230,7 @@ def unit_state():
             ["systemctl", "--user", "is-active", "tetherd.service"],
             capture_output=True, text=True, timeout=3,
         )
-        return out.stdout.strip() or "unknown"
+        return clean(out.stdout, 32) or "unknown"
     except (OSError, subprocess.SubprocessError):
         return "unknown"
 
@@ -118,29 +259,31 @@ def installed():
 def number_of(address):
     """A dialable number from a thread or contact address, or ''."""
     address = str(address or "")
-    return address[4:] if address.startswith("tel:") else ""
+    return clean(address[4:], MAX_NUMBER) if address.startswith("tel:") else ""
 
 
 def thread_view(t):
+    thread = ident(t.get("thread"))
     return {
-        "thread": t.get("thread") or "",
-        "name": t.get("name") or t.get("address") or "Unknown",
-        "preview": " ".join(str(t.get("preview") or "").split()),
-        "timestamp": int(t.get("timestamp") or 0),
-        "unread": int(t.get("unread") or 0),
+        "thread": thread,
+        "name": clean(t.get("name"), MAX_NAME) or clean(t.get("address"), MAX_NAME) or "Unknown",
+        "preview": " ".join(clean(t.get("preview"), MAX_PREVIEW * 2).split())[:MAX_PREVIEW],
+        "timestamp": count(t.get("timestamp"), MAX_TIME),
+        "unread": count(t.get("unread"), 99999),
         "group": bool(t.get("group")),
         "repliable": t.get("repliable") is not False,
-        "reason": t.get("reply_reason") or "",
-        "number": number_of(t.get("thread")),
+        "reason": clean(t.get("reply_reason"), MAX_NOTE),
+        "number": number_of(thread),
     }
 
 
 def call_view(c):
+    path = c.get("path")
     return {
-        "path": c.get("path") or "",
-        "number": c.get("number") or "",
-        "name": c.get("name") or "",
-        "state": c.get("state") or "",
+        "path": path if isinstance(path, str) and CALL_PATH.match(path) else "",
+        "number": clean(c.get("number"), MAX_NUMBER),
+        "name": clean(c.get("name"), MAX_NAME),
+        "state": clean(c.get("state"), 32),
         "ringing": bool(c.get("ringing")),
         "outgoing": bool(c.get("outgoing")),
         "connected": bool(c.get("connected")),
@@ -148,12 +291,20 @@ def call_view(c):
     }
 
 
+def addresses_of(contact):
+    """A contact's address strings, bounded."""
+    found = contact.get("addresses")
+    if not isinstance(found, list):
+        return []
+    return [a for a in (ident(a) for a in found[:16]) if a]
+
+
 def contact_name(d, number):
     """Name for a caller the phone sent without one. iOS reports calls in the
     national form (0763…) while contacts hold +41763…, and tetherd's search
     misses across that leading 0, so search on the digits without it and keep
     only contacts whose number ends in them."""
-    digits = "".join(ch for ch in str(number or "") if ch.isdigit()).lstrip("0")
+    digits = "".join(ch for ch in str(number or "") if ch in "0123456789").lstrip("0")
     if len(digits) < 6:
         return ""
     try:
@@ -161,20 +312,20 @@ def contact_name(d, number):
                       want={"bt_contacts"}, deadline=1.5)
     except (OSError, TimeoutError):
         return ""
-    for c in r.get("contacts") or []:
-        for a in c.get("addresses") or []:
-            if a.startswith("tel:") and "".join(ch for ch in a if ch.isdigit()).endswith(digits):
-                return c.get("name") or ""
+    for c in rows(r.get("contacts"), 10):
+        for a in addresses_of(c):
+            if a.startswith("tel:") and "".join(ch for ch in a if ch in "0123456789").endswith(digits):
+                return clean(c.get("name"), MAX_NAME)
     return ""
 
 
 def messages(thread):
     r = simple({"command": "bt_list_messages", "thread": thread}, {"bt_messages"})
-    msgs = sorted(r.get("messages") or [], key=lambda m: m.get("timestamp") or 0)[-40:]
+    msgs = sorted(rows(r.get("messages"), 2000), key=lambda m: count(m.get("timestamp"), MAX_TIME))[-40:]
     out = [{
-        "handle": m.get("handle") or "",
-        "body": m.get("body") or "",
-        "timestamp": int(m.get("timestamp") or 0),
+        "handle": ident(m.get("handle")),
+        "body": clean(m.get("body"), MAX_BODY, multiline=True),
+        "timestamp": count(m.get("timestamp"), MAX_TIME),
         "outgoing": bool(m.get("outgoing")),
         "read": m.get("read") is not False,
     } for m in msgs]
@@ -185,57 +336,80 @@ def messages(thread):
         d = Daemon()
         try:
             for h in unread:
-                d.sock.sendall((json.dumps({"command": "bt_mark_read", "handle": h, "read": True}) + "\n").encode())
+                d.send({"command": "bt_mark_read", "handle": h, "read": True})
         finally:
             d.close()
     return {"ok": True, "thread": thread, "messages": out}
 
 
 def reply(thread, body):
-    if not body.strip():
+    if not isinstance(body, str) or not body.strip():
         return {"ok": False, "message": "Message is empty"}
+    if len(body) > MAX_REPLY or "\0" in body:
+        return {"ok": False, "message": "Message is too long"}
     op = "omarchy-%d" % int(time.time() * 1000)
     d = Daemon(timeout=20.0)
     try:
         # The result is a broadcast, so listen as a subscriber before sending.
-        d.sock.sendall(b'{"command":"subscribe"}\n')
-        d.sock.sendall((json.dumps({"command": "bt_send_message", "thread": thread,
-                                    "body": body, "operation_id": op}) + "\n").encode())
+        d.send({"command": "subscribe"})
+        d.send({"command": "bt_send_message", "thread": thread, "body": body, "operation_id": op})
         end = time.monotonic() + 20.0
         while time.monotonic() < end:
             r = d.request_line(end)
             if r and r.get("command") == "bt_send_result" and r.get("operation_id") in (op, None):
                 if r.get("success"):
                     return {"ok": True, "message": "Sent"}
-                return {"ok": False, "message": r.get("message") or "The iPhone did not take the message"}
+                return {"ok": False,
+                        "message": clean(r.get("message"), MAX_NOTE) or "The iPhone did not take the message"}
     finally:
         d.close()
     return {"ok": False, "message": "No answer from the iPhone"}
 
 
 def contacts(query):
-    r = simple({"command": "bt_list_contacts", "query": query, "limit": 12}, {"bt_contacts"})
+    r = simple({"command": "bt_list_contacts", "query": clean(query, MAX_NUMBER), "limit": 12}, {"bt_contacts"})
     out = []
-    for c in r.get("contacts") or []:
-        for a in c.get("addresses") or []:
-            out.append({"name": c.get("name") or a, "address": a, "number": number_of(a)})
+    for c in rows(r.get("contacts"), 50):
+        for a in addresses_of(c):
+            out.append({"name": clean(c.get("name"), MAX_NAME) or clean(a, MAX_NAME),
+                        "address": a, "number": number_of(a)})
     return {"ok": True, "contacts": out[:12]}
 
 
 def call_history():
     r = simple({"command": "bt_list_call_history"}, {"bt_call_history"})
-    calls = sorted(r.get("calls") or [], key=lambda c: -(c.get("timestamp") or 0))[:10]
+    calls = sorted(rows(r.get("calls"), 500), key=lambda c: -count(c.get("timestamp"), MAX_TIME))[:10]
     return {"ok": True, "calls": [{
-        "number": c.get("number") or "",
-        "name": c.get("name") or "",
-        "type": c.get("type") or "",
-        "timestamp": int(c.get("timestamp") or 0),
+        "number": clean(c.get("number"), MAX_NUMBER),
+        "name": clean(c.get("name"), MAX_NAME),
+        "type": clean(c.get("type"), 32),
+        "timestamp": count(c.get("timestamp"), MAX_TIME),
     } for c in calls]}
 
 
 def call_result(payload):
     r = simple(payload, {"bt_call_result"})
-    return {"ok": bool(r.get("success")), "message": r.get("message") or ""}
+    return {"ok": bool(r.get("success")), "message": clean(r.get("message"), MAX_NOTE)}
+
+
+def received_files(snap):
+    """The files the daemon lists as received, newest first, without repeats."""
+    seen = set()
+    out = []
+    for f in reversed(rows(snap.get("recent_received_files"), 200)):
+        path = f.get("path")
+        if not isinstance(path, str) or not os.path.isabs(path) or len(path) > MAX_PATH:
+            continue
+        if path in seen or clean(path, MAX_PATH) != path:
+            continue
+        seen.add(path)
+        out.append({
+            "path": path,
+            "name": clean(f.get("filename"), 255) or os.path.basename(path),
+            "bytes": count(f.get("bytes_written")),
+            "exists": os.path.exists(path),
+        })
+    return out
 
 
 def status():
@@ -262,7 +436,7 @@ def status():
     try:
         d = Daemon()
     except OSError as e:
-        result["error"] = "Socket unreachable: %s" % e
+        result["error"] = clean("Socket unreachable: %s" % e, MAX_NOTE)
         return result
 
     try:
@@ -273,62 +447,55 @@ def status():
         result["firewall"] = bool(snap.get("firewall_active"))
 
         live = {}
-        for c in snap.get("connected_clients") or []:
-            fp = c.get("fingerprint") or ""
-            if fp and c.get("paired"):
+        for c in rows(snap.get("connected_clients"), 64):
+            fp = c.get("fingerprint")
+            if isinstance(fp, str) and FINGERPRINT.match(fp) and c.get("paired"):
                 live[fp] = c
 
-        for p in snap.get("paired_devices") or []:
-            fp = p.get("fingerprint") or ""
+        for p in rows(snap.get("paired_devices"), 64):
+            fp = p.get("fingerprint")
+            if not isinstance(fp, str) or not FINGERPRINT.match(fp):
+                continue
             c = live.get(fp)
             result["devices"].append({
                 "fingerprint": fp,
-                "name": p.get("device_name") or "Unknown Device",
+                "name": clean(p.get("device_name"), MAX_NAME) or "Unknown Device",
                 "connected": c is not None,
-                "address": (c or {}).get("address") or "",
+                "address": clean((c or {}).get("address"), 64),
             })
         result["devices"].sort(key=lambda x: (not x["connected"], x["name"].lower()))
 
-        for p in snap.get("pending_pairs") or []:
+        for p in rows(snap.get("pending_pairs"), 16):
+            fp = p.get("fingerprint")
+            if not isinstance(fp, str) or not FINGERPRINT.match(fp):
+                continue
             result["pending"].append({
-                "fingerprint": p.get("fingerprint") or "",
-                "name": p.get("device_name") or "Unknown Device",
+                "fingerprint": fp,
+                "name": clean(p.get("device_name"), MAX_NAME) or "Unknown Device",
             })
 
-        seen = set()
-        for f in reversed(snap.get("recent_received_files") or []):
-            path = f.get("path") or ""
-            if not path or path in seen:
-                continue
-            seen.add(path)
-            result["received"].append({
-                "path": path,
-                "name": f.get("filename") or os.path.basename(path),
-                "bytes": int(f.get("bytes_written") or 0),
-                "exists": os.path.exists(path),
-            })
-            if len(result["received"]) >= 8:
-                break
+        result["received"] = received_files(snap)[:8]
 
         # Bluetooth is optional (messages/notifications); an old daemon or no
         # adapter just leaves it null.
         try:
             bt = d.request({"command": "bt_connection"},
                            want={"bt_connection", "bt_connection_changed"}, deadline=1.5)
+            calls = bt.get("calls") if isinstance(bt.get("calls"), dict) else None
             result["bt"] = {
                 "present": bool(bt.get("device_present")),
                 "paired": bool(bt.get("device_paired")),
                 "messages": bool(bt.get("map_open")),
                 "contacts": bool(bt.get("pbap_open")),
                 "notifications": bool(bt.get("ancs_ready")),
-                "reason": bt.get("profile_reason") or bt.get("link_reason") or "",
-                "battery": int(bt.get("battery") or 0),
+                "reason": clean(bt.get("profile_reason"), MAX_NOTE) or clean(bt.get("link_reason"), MAX_NOTE),
+                "battery": count(bt.get("battery"), 100),
                 # `available` is the gateway's own readiness (HFP state "connected");
                 # `reason` is set even then, as an informational note.
-                "calls_ready": isinstance(bt.get("calls"), dict) and bt["calls"].get("available") is True,
-                "signal": int((bt.get("calls") or {}).get("signal") or 0) if isinstance(bt.get("calls"), dict) else 0,
-                "calls_reason": (bt.get("calls") or {}).get("reason", "") if isinstance(bt.get("calls"), dict) else "",
-                "operator": (bt.get("calls") or {}).get("operator", "") if isinstance(bt.get("calls"), dict) else "",
+                "calls_ready": calls is not None and calls.get("available") is True,
+                "signal": count((calls or {}).get("signal"), 100),
+                "calls_reason": clean((calls or {}).get("reason"), MAX_NOTE),
+                "operator": clean((calls or {}).get("operator"), 64),
             }
         except (OSError, TimeoutError):
             pass
@@ -345,29 +512,30 @@ def status():
                 address = st.get("device_address") or ""
                 if address:
                     devs = d.request({"command": "bt_list_devices"}, want={"bt_devices"}, deadline=1.5)
-                    for dev in devs.get("devices") or []:
+                    for dev in rows(devs.get("devices"), 64):
                         if dev.get("address") == address and dev.get("name"):
-                            result["phone_name"] = dev["name"]
+                            result["phone_name"] = clean(dev.get("name"), MAX_NAME)
                             break
             except (OSError, TimeoutError):
                 pass
             try:
                 th = d.request({"command": "bt_list_threads"}, want={"bt_threads"}, deadline=2.0)
-                threads = sorted(th.get("threads") or [], key=lambda t: -(t.get("timestamp") or 0))
-                result["unread"] = sum(int(t.get("unread") or 0) for t in threads)
-                result["threads"] = [thread_view(t) for t in threads[:8]]
+                threads = sorted(rows(th.get("threads"), 2000),
+                                 key=lambda t: -count(t.get("timestamp"), MAX_TIME))
+                result["unread"] = min(99999, sum(count(t.get("unread"), 99999) for t in threads))
+                result["threads"] = [v for v in (thread_view(t) for t in threads[:8]) if v["thread"]]
             except (OSError, TimeoutError):
                 pass
             try:
                 calls = d.request({"command": "bt_list_calls"}, want={"bt_calls"}, deadline=1.5)
-                result["calls"] = [call_view(c) for c in calls.get("calls") or []]
+                result["calls"] = [c for c in (call_view(c) for c in rows(calls.get("calls"), 8)) if c["path"]]
                 for c in result["calls"]:
                     if not c["name"] and c["number"] and not c["withheld"]:
                         c["name"] = contact_name(d, c["number"])
             except (OSError, TimeoutError):
                 pass
     except (OSError, TimeoutError) as e:
-        result["error"] = str(e)
+        result["error"] = clean(str(e), MAX_NOTE)
     finally:
         d.close()
 
@@ -400,12 +568,14 @@ def clipboard_files():
     except (OSError, subprocess.SubprocessError):
         return []
     paths = []
-    for line in raw.splitlines():
+    for line in raw[:MAX_CLIPBOARD].splitlines():
         line = line.strip()
         if line.startswith("file://"):
             p = urllib.parse.unquote(urllib.parse.urlparse(line).path)
-            if os.path.isfile(p):
+            if "\0" not in p and len(p) <= MAX_PATH and os.path.isfile(p):
                 paths.append(p)
+        if len(paths) >= MAX_FILES:
+            break
     return paths
 
 
@@ -441,7 +611,7 @@ def send(paths):
                       want=None, deadline=5.0)
     finally:
         d.close()
-    names = ", ".join(os.path.basename(p) for p in paths[:3])
+    names = ", ".join(clean(os.path.basename(p), 80) for p in paths[:3])
     more = " and %d more" % (len(paths) - 3) if len(paths) > 3 else ""
     return {"ok": True, "message": "Sending %s%s" % (names, more)}
 
@@ -472,12 +642,182 @@ def send_clipboard():
         text = ""
     if not text:
         return {"ok": False, "message": "Clipboard is empty"}
+    if len(text) > MAX_CLIPBOARD:
+        return {"ok": False, "message": "Clipboard text is too large to send"}
     d = Daemon()
     try:
         d.request({"command": "clipboard_set", "content": text}, want=None, deadline=3.0)
     finally:
         d.close()
     return {"ok": True, "message": "Clipboard sent to iPhone"}
+
+
+def state_dir():
+    """This plugin's private directory under the user's runtime directory, or
+    None when there is no safe place for one. Never a shared temp directory."""
+    path = os.path.join(runtime_base(), PLUGIN_ID)
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        return None
+    return path
+
+
+def claim(key, window=0.0, directory=None):
+    """Whether this copy of the widget shows the notification for `key`. The
+    bar creates the widget once per monitor, so every copy sees the same event.
+    With `window`, the first copy within that many seconds wins. Without, the
+    first copy holds the lock until it exits (a call: for as long as it rings).
+    Returns None when another copy has it, otherwise something to keep."""
+    directory = directory or state_dir()
+    if directory is None:
+        return True
+    name = hashlib.sha256(key.encode()).hexdigest()[:32] + ".lock"
+    try:
+        fd = os.open(os.path.join(directory, name),
+                     os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    if not window:
+        return fd
+    try:
+        last = float(os.read(fd, 32) or b"0")
+    except ValueError:
+        last = 0.0
+    now = time.time()
+    if 0 <= now - last < window:
+        os.close(fd)
+        return None
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    os.write(fd, repr(now).encode())
+    os.close(fd)
+    return True
+
+
+def session_bus():
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib
+    return Gio, GLib, Gio.bus_get_sync(Gio.BusType.SESSION, None)
+
+
+def on_terminate(GLib, handler):
+    """Run `handler` from the main loop when this process is asked to stop."""
+    try:
+        import gi
+        gi.require_version("GLibUnix", "2.0")
+        from gi.repository import GLibUnix
+        GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, handler)
+    except (ImportError, ValueError, AttributeError):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, handler)
+
+
+def notification_text(req):
+    """(lock key, lock window, summary, body, icon, actions, urgency) for a
+    notification request. The wording lives here so a request can only choose
+    among the notifications this widget has."""
+    kind = req.get("kind")
+    if kind == "pairing":
+        name = clean(req.get("name"), MAX_NAME) or "A device"
+        return ("pair-" + want_fingerprint(req.get("fingerprint")), 10.0,
+                "iPhone wants to pair",
+                "%s is asking to pair with Tether. Open the bar widget to accept." % name,
+                "/usr/share/icons/Adwaita/symbolic/devices/phone-symbolic.svg", [], None)
+    if kind == "call":
+        name = clean(req.get("name"), MAX_NAME)
+        number = clean(req.get("number"), MAX_NUMBER)
+        label = name or ("Unknown caller" if req.get("withheld") is True or not number else number)
+        return ("call-" + want_call_path(req.get("path"), required=True), 0.0,
+                "Incoming call", label + (" · " + number if name and number else ""),
+                "/usr/share/icons/Adwaita/symbolic/actions/call-start-symbolic.svg",
+                ["answer", "Answer", "hangup", "Decline"], 2)
+    raise ValueError("Unknown notification")
+
+
+def notify(req):
+    """Show a notification over the session bus, so its text is never an
+    argument. A call's notification stays until it is answered, declined,
+    closed, or this process is stopped because the call ended; the chosen
+    action is printed on its own line."""
+    key, window, summary, body, icon, actions, urgency = notification_text(req)
+    held = claim(key, window)
+    if held is None:
+        return {"ok": True, "shown": False}
+    try:
+        Gio, GLib, bus = session_bus()
+    except (ImportError, ValueError):
+        return {"ok": False, "message": "Notifications need python-gobject"}
+
+    service = ("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+               "org.freedesktop.Notifications")
+
+    def call(method, args=None, reply=None):
+        return bus.call_sync(*service, method, args, reply, Gio.DBusCallFlags.NONE, 3000, None)
+
+    # The body is markup where the server says so; the summary never is.
+    if "body-markup" in call("GetCapabilities", None, GLib.VariantType("(as)")).unpack()[0]:
+        body = html.escape(body, quote=False)
+    hints = {} if urgency is None else {"urgency": GLib.Variant("y", urgency)}
+    shown = {"id": 0}
+    loop = GLib.MainLoop()
+
+    def on_signal(_bus, _sender, _path, _iface, name, params):
+        values = params.unpack()
+        if not shown["id"] or values[0] != shown["id"]:
+            return
+        if name == "ActionInvoked" and values[1] in ("answer", "hangup"):
+            print(values[1], flush=True)
+        loop.quit()
+
+    def stop(*_):
+        try:
+            call("CloseNotification", GLib.Variant("(u)", (shown["id"],)))
+        except GLib.Error:
+            pass
+        loop.quit()
+        return False
+
+    if actions:
+        bus.signal_subscribe(service[0], service[2], None, service[1], None,
+                             Gio.DBusSignalFlags.NONE, on_signal)
+    shown["id"] = call("Notify", GLib.Variant("(susssasa{sv}i)", (
+        "Tether", 0, icon, summary, body, actions, hints, -1)), GLib.VariantType("(u)")).unpack()[0]
+    if actions:
+        on_terminate(GLib, stop)
+        GLib.timeout_add_seconds(180, stop)
+        loop.run()
+    return {"ok": True, "shown": True}
+
+
+def show_file(path):
+    """Reveal a received file in the file manager, over the session bus. Only
+    a file the daemon itself lists as received, so this cannot be pointed at
+    anything else."""
+    d = Daemon()
+    try:
+        snap = d.request({"command": "state_snapshot"}, want={"state_snapshot"})
+    finally:
+        d.close()
+    if not any(f["path"] == path and f["exists"] for f in received_files(snap)):
+        return {"ok": False, "message": "That file is no longer there"}
+    try:
+        Gio, GLib, bus = session_bus()
+        bus.call_sync("org.freedesktop.FileManager1", "/org/freedesktop/FileManager1",
+                      "org.freedesktop.FileManager1", "ShowItems",
+                      GLib.Variant("(ass)", (["file://" + urllib.parse.quote(path)], "")),
+                      None, Gio.DBusCallFlags.NONE, 5000, None)
+    except (ImportError, ValueError):
+        return {"ok": False, "message": "Opening files needs python-gobject"}
+    return {"ok": True, "message": "Shown in Files"}
 
 
 WATCHED_EVENTS = {
@@ -492,14 +832,10 @@ def watch():
     so it can refresh at once instead of waiting for the next poll. Exits when
     the daemon goes away; the widget restarts it."""
     d = Daemon(timeout=None)
-    d.sock.sendall(b'{"command":"subscribe"}\n')
+    d.send({"command": "subscribe"})
     print("ready", flush=True)
     try:
-        while True:
-            chunk = d.sock.recv(65536)
-            if not chunk:
-                return
-            d.buf += chunk
+        while d.fill():
             while b"\n" in d.buf:
                 line, d.buf = d.buf.split(b"\n", 1)
                 try:
@@ -512,60 +848,93 @@ def watch():
         d.close()
 
 
+def read_request(stream):
+    """The one JSON request on stdin: a bounded line holding an object."""
+    line = stream.readline(MAX_REQUEST + 1)
+    if len(line) > MAX_REQUEST:
+        raise ValueError("Request is too large")
+    try:
+        req = json.loads(line.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise ValueError("Request is not valid JSON") from None
+    if not isinstance(req, dict):
+        raise ValueError("Request is not an object")
+    return req
+
+
+def handle(req):
+    cmd = req.get("cmd")
+    if cmd == "accept":
+        r = simple({"command": "accept_device", "fingerprint": want_fingerprint(req.get("fingerprint"))},
+                   {"accept_device_result"})
+        return {"ok": bool(r.get("accepted")),
+                "message": "Paired" if r.get("accepted") else "Pairing was not accepted"}
+    if cmd == "forget":
+        r = simple({"command": "forget_device", "fingerprint": want_fingerprint(req.get("fingerprint"))},
+                   {"forget_device_result"})
+        return {"ok": bool(r.get("forgotten")),
+                "message": "Forgot device" if r.get("forgotten") else "Device was not paired"}
+    if cmd == "clipboard":
+        return send_clipboard()
+    if cmd == "send":
+        return send(want_paths(req.get("paths")))
+    if cmd == "send-clipboard":
+        files = clipboard_files()
+        return send(files) if files else {"ok": False, "message": "No copied files on the clipboard"}
+    if cmd == "send-screenshot":
+        shot = latest_screenshot()
+        return send([shot]) if shot else {"ok": False, "message": "No screenshot found"}
+    if cmd == "messages":
+        return messages(want_thread(req.get("thread")))
+    if cmd == "reply":
+        return reply(want_thread(req.get("thread")), req.get("body"))
+    if cmd == "contacts":
+        return contacts(req.get("query"))
+    if cmd == "history":
+        return call_history()
+    if cmd == "dial":
+        number = want_number(req.get("number"))
+        out = call_result({"command": "bt_call_dial", "number": number})
+        if out["ok"]:
+            out["message"] = "Calling %s from the iPhone" % number
+        return out
+    if cmd in ("answer", "hangup"):
+        out = call_result({"command": "bt_call_action", "action": cmd,
+                           "path": want_call_path(req.get("path"))})
+        if out["ok"]:
+            out["message"] = "Answered — audio stays on the iPhone" if cmd == "answer" else "Call ended"
+        return out
+    if cmd == "notify":
+        return notify(req)
+    if cmd == "show-file":
+        path = req.get("path")
+        if not isinstance(path, str):
+            raise ValueError("Not a file path")
+        return show_file(path)
+    return {"ok": False, "message": "Unknown command"}
+
+
 def main(argv):
-    if len(argv) > 1 and argv[1] == "watch":
+    cmd = argv[1] if len(argv) > 1 else "status"
+    if len(argv) > 2 or cmd not in ("status", "watch", "request"):
+        # Refused rather than ignored, so data can never be passed this way.
+        print(json.dumps({"ok": False, "message": "Requests are read from stdin, not arguments"}))
+        return 2
+    if cmd == "watch":
         try:
             watch()
         except OSError:
             pass
         return 0
-    cmd = argv[1] if len(argv) > 1 else "status"
     try:
-        if cmd == "status":
-            out = status()
-        elif cmd == "accept":
-            r = simple({"command": "accept_device", "fingerprint": argv[2]},
-                       {"accept_device_result"})
-            out = {"ok": bool(r.get("accepted")),
-                   "message": "Paired" if r.get("accepted") else "Pairing was not accepted"}
-        elif cmd == "forget":
-            r = simple({"command": "forget_device", "fingerprint": argv[2]},
-                       {"forget_device_result"})
-            out = {"ok": bool(r.get("forgotten")),
-                   "message": "Forgot device" if r.get("forgotten") else "Device was not paired"}
-        elif cmd == "clipboard":
-            out = send_clipboard()
-        elif cmd == "send":
-            out = send(argv[2:])
-        elif cmd == "send-clipboard":
-            files = clipboard_files()
-            out = send(files) if files else {"ok": False, "message": "No copied files on the clipboard"}
-        elif cmd == "send-screenshot":
-            shot = latest_screenshot()
-            out = send([shot]) if shot else {"ok": False, "message": "No screenshot found"}
-        elif cmd == "messages":
-            out = messages(argv[2])
-        elif cmd == "reply":
-            out = reply(argv[2], argv[3])
-        elif cmd == "contacts":
-            out = contacts(argv[2] if len(argv) > 2 else "")
-        elif cmd == "history":
-            out = call_history()
-        elif cmd == "dial":
-            out = call_result({"command": "bt_call_dial", "number": argv[2]})
-            if out["ok"]:
-                out["message"] = "Calling %s from the iPhone" % argv[2]
-        elif cmd in ("answer", "hangup"):
-            path = argv[2] if len(argv) > 2 else ""
-            out = call_result({"command": "bt_call_action", "action": cmd, "path": path})
-            if out["ok"]:
-                out["message"] = "Answered — audio stays on the iPhone" if cmd == "answer" else "Call ended"
-        else:
-            out = {"ok": False, "message": "Unknown command: %s" % cmd}
+        out = status() if cmd == "status" else handle(read_request(sys.stdin.buffer))
     except FileNotFoundError:
         out = {"ok": False, "message": "Tether daemon is not running"}
-    except (OSError, TimeoutError, IndexError) as e:
-        out = {"ok": False, "message": str(e) or e.__class__.__name__}
+    except (OSError, TimeoutError, ValueError) as e:
+        out = {"ok": False, "message": clean(str(e), MAX_NOTE) or e.__class__.__name__}
+    except Exception:
+        # No traceback: it could carry message text into the shell's log.
+        out = {"ok": False, "message": "Tether action failed"}
     print(json.dumps(out))
     return 0
 

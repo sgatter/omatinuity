@@ -185,7 +185,8 @@ Panel {
   }
 
   function runSetup() {
-    Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", "'" + setupScript + "'"])
+    // The launcher hands its argument to bash -c, so quote the path for a shell.
+    Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", "'" + setupScript.replace(/'/g, "'\\''") + "'"])
     root.close()
   }
 
@@ -221,13 +222,8 @@ Panel {
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
-  // wl-copy rather than the TextEdit's own copy(): the panel is a layer
-  // surface, and wl-copy keeps serving the selection after it closes.
   function copyText(text) {
-    var t = String(text || "")
-    if (t === "") return
-    Quickshell.execDetached(["wl-copy", "--", t])
-    tether.flash("Copied")
+    if (tether.copy(text)) tether.flash("Copied")
   }
 
   function sendReply() {
@@ -393,6 +389,7 @@ Panel {
               iconOpacity: root.phoneHere ? 1.0 : 0.5
               iconComponent: Component {
                 Text {
+                  textFormat: Text.PlainText
                   text: root.phoneGlyph
                   color: root.hasPending || root.ringing ? root.urgent : root.foreground
                   font.family: root.fontFamily
@@ -504,6 +501,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: tether.threads.length === 0
               width: parent.width
               text: tether.messagesReady ? "No conversations yet." : root.btSetupNeeded ? "Finish the Bluetooth setup below; the iPhone then offers Messages and Contacts access." : (tether.bt && tether.bt.reason ? tether.bt.reason : "Messages are not connected.")
@@ -569,6 +567,7 @@ Panel {
             title: "DEVICES"
 
             Text {
+              textFormat: Text.PlainText
               visible: tether.devices.length === 0
               width: parent.width
               text: "Open the Tether app on your iPhone on the same Wi-Fi, then accept the request here."
@@ -657,6 +656,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: root.view === "thread" && tether.conversation.length === 0
             width: parent.width
             text: tether.conversationLoading ? "Loading…" : "No messages yet. Say hi."
@@ -685,6 +685,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: root.view === "thread" && !!root.openThreadInfo && root.openThreadInfo.repliable === false
             width: parent.width
             text: root.openThreadInfo && root.openThreadInfo.reason ? root.openThreadInfo.reason : "Replies to this conversation are not supported."
@@ -765,6 +766,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: (root.dialQuery === "" ? tether.history.length : tether.contactResults.length) === 0 && root.dialNumber === ""
               width: parent.width
               text: root.dialQuery === "" ? "No recent calls." : "No matching contacts."
@@ -926,6 +928,7 @@ Panel {
     spacing: Style.space(4)
 
     Text {
+      textFormat: Text.PlainText
       visible: bubble.showTime
       width: parent.width
       text: root.formatTime(bubble.message.timestamp)

@@ -17,14 +17,15 @@ io.github.sgatter.omatinuity/
 ├── Service.qml          state, polling and actions (shared by icon and panel)
 ├── backend.py           talks to tetherd over $XDG_RUNTIME_DIR/tether/tetherd.sock
 ├── bin/tether-gtk       notification-click redirect (see below)
-└── setup-bluetooth.sh   one-time Bluetooth setup for messages and calls
+├── setup-bluetooth.sh   one-time Bluetooth setup for messages and calls
+└── tests/               regression tests for the rules under Security
 ```
 
 ## Dependencies and privileges
 
 - An iPhone with the Tether app, on the same Wi-Fi as the computer.
-- `tether` (AUR) for `tetherd`; `python3`; `wl-clipboard`; `libnotify` (`notify-send`);
-  `util-linux` (`flock`).
+- `tether` (AUR) for `tetherd`; `python3` with `python-gobject`; `wl-clipboard`. All but
+  `tether` ship with Omarchy.
 - The widget runs unsandboxed in the Omarchy shell with your user permissions. It only talks
   to your own `tetherd` socket and runs `systemctl --user start|stop tetherd`.
 - `setup-bluetooth.sh` uses `sudo` (bluetoothd flag, adapter class service). Read it first.
@@ -73,6 +74,32 @@ tetherd launches `tether-gtk --thread=<key>` for a click; `bin/tether-gtk` turns
 `omarchy-shell io.github.sgatter.omatinuity openThread <key>` and passes anything else to
 `/usr/bin/tether-gtk`.
 
+## Security
+
+Messages, numbers and contact names are private, and everything the phone sends is written by
+other people. The plugin keeps to two rules, both covered by `tests/`:
+
+- **Nothing private in process arguments.** Other local accounts can read
+  `/proc/<pid>/cmdline`. Reply text, copied message text, numbers, names, thread keys and file
+  paths go to the helper as one JSON request on stdin, to `wl-copy` on stdin, and to the
+  notification server and file manager over the session bus. The helper refuses data passed as
+  arguments. The only commands the widget starts are fixed strings.
+- **Nothing from the phone is trusted.** The helper type-checks and bounds every field, drops
+  control characters and text-direction overrides, and caps replies from the daemon. Every text
+  element is plain text, so markup in a message or a caller name is shown, never interpreted;
+  notification bodies are escaped. Numbers, thread keys, call paths and device fingerprints are
+  validated before they reach the daemon.
+
+Also: the helper runs as `/usr/bin/python3 -I` and only talks to a `tetherd` socket owned by
+your user; lock files live in a private directory under `$XDG_RUNTIME_DIR`, never in `/tmp`;
+"show in Files" only works for files the daemon lists as received.
+
+Outside the plugin's control: Tether itself starts `tether-gtk --thread=<key>` when a
+notification is clicked, so the thread key (a phone number or sender name, never message text)
+is in that process's arguments, and in those of the `omarchy-shell … openThread` call the
+redirect makes from it. Anything you type after `omarchy-shell io.github.sgatter.omatinuity`
+yourself (`dial`, `send`) is an argument like in any command.
+
 ## Usage
 
 Left click toggles the panel, middle click answers a ringing call (otherwise sends the
@@ -113,7 +140,10 @@ Example in `~/.config/hypr/bindings.lua`:
 
 ```sh
 omarchy plugin update io.github.sgatter.omatinuity
+omarchy restart shell
 ```
+
+The restart matters: a running shell can keep the old QML loaded next to the new helper.
 
 ## Remove
 
@@ -138,4 +168,5 @@ sudo systemctl daemon-reload && sudo systemctl restart bluetooth
 ```sh
 omarchy plugin validate ~/.config/omarchy/plugins/io.github.sgatter.omatinuity
 qmllint -I "$OMARCHY_PATH/shell" BarWidget.qml Panel.qml
+python3 -m unittest discover -s tests
 ```

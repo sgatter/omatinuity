@@ -12,6 +12,9 @@ Item {
   property var settings: ({})
 
   readonly property string backendPath: String(Qt.resolvedUrl("backend.py")).replace(/^file:\/\//, "")
+  // The system interpreter by absolute path and isolated (-I): no PATH lookup,
+  // no PYTHON* environment, no user site-packages.
+  readonly property var backend: ["/usr/bin/python3", "-I", backendPath]
 
   property bool installed: true
   property bool running: false
@@ -68,6 +71,7 @@ Item {
   readonly property bool notifyPairing: setting("notifyPairing", true) !== false
 
   property var _notifiedPending: ({})
+  property var _notifyQueue: []
   property string _statusOut: ""
   property string _actionOut: ""
   property string _controlErr: ""
@@ -88,7 +92,7 @@ Item {
   function refresh() {
     if (statusProcess.running) return
     _statusOut = ""
-    statusProcess.command = ["python3", backendPath, "status"]
+    statusProcess.command = backend.concat(["status"])
     statusProcess.running = true
   }
 
@@ -131,33 +135,75 @@ Item {
     pending = next
   }
 
-  // The bar creates this widget once per monitor, so every copy sees the same
-  // event. A shared non-blocking lock lets only the first copy notify; it is
-  // held a few seconds (or, for a call, until the notification is answered).
-  function onceCommand(key, args, holdSeconds) {
-    var lock = (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/io.github.sgatter.omatinuity-" + String(key).replace(/[^A-Za-z0-9]+/g, "_") + ".lock"
-    // -o: only flock holds the lock, so stopping it (call ended) frees it.
-    return ["flock", "-n", "-o", lock, "sh", "-c", '"$@"; s=$?; sleep ' + holdSeconds + '; exit $s', "sh"].concat(args)
+  // A backend call that carries data. The request goes to the helper's stdin
+  // as one JSON line, never into its arguments: /proc/<pid>/cmdline is
+  // readable by other local accounts, and requests hold message text, phone
+  // numbers and names.
+  component Request: Process {
+    property string payload: ""
+    stdinEnabled: true
+    onStarted: {
+      write(payload)
+      payload = ""
+      stdinEnabled = false
+    }
   }
 
-  function notify(title, body) {
-    Quickshell.execDetached(onceCommand("notify-" + title, ["notify-send", "-a", "Tether", "-i", "/usr/share/icons/Adwaita/symbolic/devices/phone-symbolic.svg", title, body], 5))
+  function submit(process, request) {
+    process.payload = JSON.stringify(request) + "\n"
+    process.command = backend.concat(["request"])
+    process.stdinEnabled = true
+    process.running = true
   }
 
-  function runAction(args, okRefresh) {
+  // Thread keys also arrive over IPC (a clicked notification); take only what
+  // a key can look like.
+  function validThread(thread) {
+    var t = String(thread || "")
+    return t !== "" && t.length <= 256 && !/[\u0000-\u001f\u007f-\u009f]/.test(t)
+  }
+
+  // Notifications go through the backend onto the session bus. The bar creates
+  // this widget once per monitor, so every copy asks; the backend lets one show.
+  function notify(request) {
+    _notifyQueue = _notifyQueue.concat([request]).slice(-8)
+    pumpNotify()
+  }
+
+  function pumpNotify() {
+    if (notifyProcess.running || _notifyQueue.length === 0) return
+    var next = _notifyQueue[0]
+    _notifyQueue = _notifyQueue.slice(1)
+    submit(notifyProcess, next)
+  }
+
+  function runAction(request) {
     if (actionProcess.running) return false
     _actionOut = ""
-    actionProcess.command = ["python3", backendPath].concat(args)
-    actionProcess.running = true
+    submit(actionProcess, request)
     return true
   }
 
-  function accept(fingerprint) { return runAction(["accept", String(fingerprint)]) }
-  function forget(fingerprint) { return runAction(["forget", String(fingerprint)]) }
-  function sendClipboardText() { return runAction(["clipboard"]) }
-  function sendCopiedFiles() { return runAction(["send-clipboard"]) }
-  function sendScreenshot() { return runAction(["send-screenshot"]) }
-  function sendFiles(paths) { return runAction(["send"].concat(paths)) }
+  function accept(fingerprint) { return runAction({ cmd: "accept", fingerprint: String(fingerprint) }) }
+  function forget(fingerprint) { return runAction({ cmd: "forget", fingerprint: String(fingerprint) }) }
+  function sendClipboardText() { return runAction({ cmd: "clipboard" }) }
+  function sendCopiedFiles() { return runAction({ cmd: "send-clipboard" }) }
+  function sendScreenshot() { return runAction({ cmd: "send-screenshot" }) }
+  function sendFiles(paths) { return runAction({ cmd: "send", paths: paths }) }
+
+  // wl-copy rather than a TextEdit's own copy(): the panel is a layer surface,
+  // and wl-copy keeps serving the selection after it closes. The text goes to
+  // its stdin, not its arguments.
+  function copy(text) {
+    var t = String(text || "")
+    if (t === "") return false
+    copyProcess.running = false
+    copyProcess.payload = t
+    copyProcess.command = ["wl-copy"]
+    copyProcess.stdinEnabled = true
+    copyProcess.running = true
+    return true
+  }
 
   function callLabel(call) {
     if (!call) return ""
@@ -168,22 +214,20 @@ Item {
   function notifyIncomingCall(call) {
     if (callNotifyProcess.running) callNotifyProcess.running = false
     callNotifyProcess.callPath = String(call.path)
-    callNotifyProcess.command = onceCommand("call-" + call.path, ["notify-send", "-a", "Tether", "-i", "/usr/share/icons/Adwaita/symbolic/actions/call-start-symbolic.svg", "-u", "critical",
-      "-A", "answer=Answer", "-A", "hangup=Decline", "--wait",
-      "Incoming call", callLabel(call) + (call.name && call.number ? " · " + call.number : "")], 0)
-    callNotifyProcess.running = true
+    submit(callNotifyProcess, { cmd: "notify", kind: "call", path: String(call.path),
+      name: String(call.name || ""), number: String(call.number || ""), withheld: call.withheld === true })
   }
 
-  function answer(path) { return runAction(["answer", String(path || "")]) }
-  function hangup(path) { return runAction(["hangup", String(path || "")]) }
+  function answer(path) { return runAction({ cmd: "answer", path: String(path || "") }) }
+  function hangup(path) { return runAction({ cmd: "hangup", path: String(path || "") }) }
   function dial(number) {
     var n = String(number || "").trim()
     if (n === "") { flash("Enter a number"); return false }
-    return runAction(["dial", n])
+    return runAction({ cmd: "dial", number: n })
   }
 
   function openConversation(thread) {
-    openThread = String(thread || "")
+    openThread = validThread(thread) ? String(thread) : ""
     conversation = []
     loadConversation()
   }
@@ -196,14 +240,13 @@ Item {
   function loadConversation() {
     if (openThread === "" || conversationProcess.running) return
     conversationLoading = true
-    conversationProcess.command = ["python3", backendPath, "messages", openThread]
-    conversationProcess.running = true
+    submit(conversationProcess, { cmd: "messages", thread: openThread })
   }
 
   function sendReply(body) {
     var text = String(body || "")
     if (openThread === "" || text.trim() === "") return false
-    if (!runAction(["reply", openThread, text])) return false
+    if (!runAction({ cmd: "reply", thread: openThread, body: text })) return false
     // Show it right away; the reload after the send replaces it with the real one.
     var next = conversation.slice()
     next.push({ body: text, outgoing: true, timestamp: Math.floor(Date.now() / 1000), pending: true })
@@ -213,14 +256,12 @@ Item {
 
   function searchContacts(query) {
     contactProcess.running = false
-    contactProcess.command = ["python3", backendPath, "contacts", String(query || "")]
-    contactProcess.running = true
+    submit(contactProcess, { cmd: "contacts", query: String(query || "") })
   }
 
   function loadHistory() {
     if (historyProcess.running) return
-    historyProcess.command = ["python3", backendPath, "history"]
-    historyProcess.running = true
+    submit(historyProcess, { cmd: "history" })
   }
 
   function threadFor(thread) {
@@ -240,9 +281,7 @@ Item {
 
   function openFile(file) {
     if (!file || !file.path) return
-    var parts = String(file.path).split("/")
-    for (var i = 0; i < parts.length; i++) parts[i] = encodeURIComponent(parts[i])
-    Quickshell.execDetached(["uwsm-app", "--", "nautilus", "--select", "file://" + parts.join("/")])
+    runAction({ cmd: "show-file", path: String(file.path) })
   }
 
   function openDownloads() {
@@ -260,7 +299,7 @@ Item {
 
   onPendingArrived: function(request) {
     if (notifyPairing)
-      notify("iPhone wants to pair", String(request.name || "A device") + " is asking to pair with Tether. Open the bar widget to accept.")
+      notify({ cmd: "notify", kind: "pairing", fingerprint: String(request.fingerprint || ""), name: String(request.name || "") })
   }
 
   Timer {
@@ -301,7 +340,7 @@ Item {
 
   Process {
     id: watchProcess
-    command: ["python3", root.backendPath, "watch"]
+    command: root.backend.concat(["watch"])
     stdout: SplitParser {
       onRead: function(line) {
         if (String(line) !== "ready") eventRefresh.restart()
@@ -309,7 +348,16 @@ Item {
     }
   }
 
-  Process {
+  Request {
+    id: notifyProcess
+    onExited: root.pumpNotify()
+  }
+
+  Request {
+    id: copyProcess
+  }
+
+  Request {
     id: callNotifyProcess
     property string callPath: ""
     stdout: SplitParser {
@@ -321,7 +369,7 @@ Item {
     }
   }
 
-  Process {
+  Request {
     id: conversationProcess
     stdout: StdioCollector { id: conversationStdout; waitForEnd: true }
     onExited: function(exitCode) {
@@ -333,7 +381,7 @@ Item {
     }
   }
 
-  Process {
+  Request {
     id: contactProcess
     stdout: StdioCollector { id: contactStdout; waitForEnd: true }
     onExited: function(exitCode) {
@@ -343,7 +391,7 @@ Item {
     }
   }
 
-  Process {
+  Request {
     id: historyProcess
     stdout: StdioCollector { id: historyStdout; waitForEnd: true }
     onExited: function(exitCode) {
@@ -387,7 +435,7 @@ Item {
     }
   }
 
-  Process {
+  Request {
     id: actionProcess
     stdout: StdioCollector { id: actionStdout; waitForEnd: true; onStreamFinished: root._actionOut = text }
     onExited: function(exitCode) {

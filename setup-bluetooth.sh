@@ -6,6 +6,11 @@ set -euo pipefail
 
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 
+if (( EUID == 0 )); then
+  echo "Run this as your own user, not as root: it asks for sudo where it needs it."
+  exit 1
+fi
+
 say "This changes Bluetooth on this machine:"
 cat <<'EOF'
   1. bluetoothd runs with --experimental (sudo; restarts Bluetooth)

@@ -9,7 +9,8 @@ for arg in "$@"; do
   case "$arg" in
     --thread=*)
       thread="${arg#--thread=}"
-      if [[ -n $thread ]] && omarchy-shell io.github.sgatter.omatinuity openThread "$thread" 2>/dev/null | grep -qx ok; then
+      # A thread key is short and printable; anything else goes to the real app.
+      if [[ -n $thread && ${#thread} -le 256 && $thread != *[[:cntrl:]]* ]] && omarchy-shell io.github.sgatter.omatinuity openThread "$thread" 2>/dev/null | grep -qx ok; then
         exit 0
       fi
       ;;
