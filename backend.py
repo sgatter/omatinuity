@@ -17,6 +17,7 @@ import html
 import json
 import os
 import re
+import select
 import signal
 import socket
 import stat
@@ -39,7 +40,9 @@ MAX_REPLY = 5000                # a message as sent
 MAX_PREVIEW = 200
 MAX_NOTE = 300                  # reasons and results from the daemon
 MAX_PATH = 4096
-MAX_CLIPBOARD = 1024 * 1024
+MAX_CLIPBOARD = 1024 * 1024     # bytes of clipboard read to send to the phone
+MAX_TYPES = 64 * 1024           # bytes of the clipboard's list of formats
+CLIPBOARD_WAIT = 2.0            # seconds a clipboard owner gets to answer
 MAX_TIME = 2 ** 40
 MAX_FILES = 64
 
@@ -47,15 +50,29 @@ MAX_FILES = 64
 # not, and iOS wraps phone numbers in embedding marks.
 BIDI_CONTROLS = frozenset(range(0x202A, 0x202F)) | frozenset(range(0x2066, 0x206A))
 BIDI_OVERRIDES = frozenset((0x202D, 0x202E))
+LINE_BREAKS = "\r\n\x0b\x0c\x85\u2028\u2029"
+# Format characters draw nothing. The two joiners stay: emoji and several
+# scripts are built with them.
+KEPT_FORMAT = frozenset((0x200C, 0x200D))
+# Letters that draw nothing either; a name made of them would look empty.
+BLANK_LETTERS = frozenset((0x115F, 0x1160, 0x3164, 0xFFA0))
 
-DIALABLE = re.compile(r"^[0-9+*#,;().\- pPwW]{1,40}$")
+# What a person dials: digits, an optional +, the usual separators. No service
+# codes (* and #) and no pauses that send tones once connected: most numbers
+# dialed here were supplied by the phone, not typed.
+DIALABLE = re.compile(r"^\+?[0-9(][0-9 ().\-]{1,38}$")
 CALL_PATH = re.compile(r"^/[A-Za-z0-9_/]{1,254}$")
 FINGERPRINT = re.compile(r"^[A-Za-z0-9:+/=_-]{8,128}$")
+# Omarchy names its captures screenshot-2026-11-17_20-31-05.png.
+SCREENSHOT_NAME = re.compile(r"^screenshot[-_ ].{1,200}\.(png|jpe?g|webp)$", re.IGNORECASE)
+IMAGE_NAME = re.compile(r"^.{1,240}\.(png|jpe?g|webp)$", re.IGNORECASE)
 
 
 def clean(value, limit, multiline=False):
     """Untrusted text made safe to show: a str of at most `limit` characters
-    with no control characters. One line unless `multiline`."""
+    with no control characters. One line unless `multiline`, and then also
+    without characters that draw nothing, so a name cannot look empty or like
+    another one."""
     if not isinstance(value, str):
         if value is None or isinstance(value, (bool, dict, list)):
             return ""
@@ -63,13 +80,16 @@ def clean(value, limit, multiline=False):
     out = []
     for ch in value[:limit * 4]:
         code = ord(ch)
-        if ch in "\r\n  ":
+        category = unicodedata.category(ch)
+        if ch in LINE_BREAKS:
             out.append("\n" if multiline else " ")
         elif ch == "\t":
             out.append(" ")
-        elif unicodedata.category(ch) in ("Cc", "Cs"):
+        elif category in ("Cc", "Cs"):
             continue
         elif code in (BIDI_OVERRIDES if multiline else BIDI_CONTROLS):
+            continue
+        elif not multiline and ((category == "Cf" and code not in KEPT_FORMAT) or code in BLANK_LETTERS):
             continue
         else:
             out.append(ch)
@@ -139,6 +159,9 @@ def want_paths(value):
     for p in value:
         if not isinstance(p, str) or not 0 < len(p) <= MAX_PATH or "\0" in p:
             raise ValueError("Not a file path")
+        # A relative path would be read against wherever the shell was started.
+        if not os.path.isabs(p):
+            raise ValueError("Give the full path of the file")
     return value
 
 
@@ -200,7 +223,8 @@ class Daemon:
                     continue
                 if not isinstance(obj, dict):
                     continue
-                if want is None or obj.get("command") in want:
+                command = obj.get("command")
+                if want is None or (isinstance(command, str) and command in want):
                     return obj
             if not self.fill():
                 break
@@ -319,7 +343,7 @@ def contact_name(d, number):
     return ""
 
 
-def messages(thread):
+def messages(thread, mark=False):
     r = simple({"command": "bt_list_messages", "thread": thread}, {"bt_messages"})
     msgs = sorted(rows(r.get("messages"), 2000), key=lambda m: count(m.get("timestamp"), MAX_TIME))[-40:]
     out = [{
@@ -329,10 +353,12 @@ def messages(thread):
         "outgoing": bool(m.get("outgoing")),
         "read": m.get("read") is not False,
     } for m in msgs]
-    # Opening a conversation reads it, as it would on the phone. mark_read
-    # writes through to the iPhone asynchronously; nothing to wait for.
+    # Opening a conversation reads it, as it would on the phone, and so does
+    # replying. Reloads in the background do not: a panel left open must not
+    # mark what nobody saw. mark_read writes through to the iPhone
+    # asynchronously; nothing to wait for.
     unread = [m["handle"] for m in out if not m["outgoing"] and not m["read"] and m["handle"]]
-    if unread:
+    if mark and unread:
         d = Daemon()
         try:
             for h in unread:
@@ -371,8 +397,11 @@ def contacts(query):
     out = []
     for c in rows(r.get("contacts"), 50):
         for a in addresses_of(c):
-            out.append({"name": clean(c.get("name"), MAX_NAME) or clean(a, MAX_NAME),
-                        "address": a, "number": number_of(a)})
+            # `address` goes back to the daemon unchanged; `label` is what
+            # is shown for it.
+            label = clean(a.split(":", 1)[1] if a.startswith(("tel:", "email:")) else a, MAX_NAME)
+            out.append({"name": clean(c.get("name"), MAX_NAME) or label or "Unknown",
+                        "address": a, "label": label, "number": number_of(a)})
     return {"ok": True, "contacts": out[:12]}
 
 
@@ -539,10 +568,6 @@ def status():
     finally:
         d.close()
 
-    # With a single Wi-Fi pairing it is the same phone, so show its real name
-    # there too; with several, only one of them can be the Bluetooth phone.
-    if result["phone_name"] and len(result["devices"]) == 1:
-        result["devices"][0]["name"] = result["phone_name"]
     return result
 
 
@@ -554,49 +579,136 @@ def simple(payload, want):
         d.close()
 
 
+def bounded_output(argv, limit, wait):
+    """What `argv` prints, read with a size limit and a time limit, so whoever
+    feeds it (for wl-paste, the clipboard's owner) can neither fill memory nor
+    keep this waiting. Returns (bytes, state): "eof" when it finished inside
+    both limits, "limit" when it had more than `limit` bytes, "timeout" after
+    `wait` seconds, "error" when it could not be started. Unless it finished,
+    the process is killed."""
+    try:
+        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL)
+    except OSError:
+        return b"", "error"
+    end = time.monotonic() + wait
+    data, state = b"", "timeout"
+    try:
+        fd = p.stdout.fileno()
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                break
+            ready, _, _ = select.select([fd], [], [], left)
+            if not ready:
+                break
+            chunk = os.read(fd, min(65536, limit + 1 - len(data)))
+            if not chunk:
+                state = "eof"
+                break
+            data += chunk
+            if len(data) > limit:
+                state = "limit"
+                break
+    finally:
+        if p.poll() is None:
+            p.kill()
+        p.stdout.close()
+        try:
+            p.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+    return data[:limit], state
+
+
+def clipboard_types():
+    """The formats the clipboard offers."""
+    data, state = bounded_output(["wl-paste", "--list-types"], MAX_TYPES, CLIPBOARD_WAIT)
+    if state != "eof":
+        return []
+    return [clean(t, 255) for t in data.decode("utf-8", "replace").split()[:256]]
+
+
+def clipboard_text(limit, primary=False):
+    """(text, state) for the clipboard's text, or the middle-click selection's
+    when `primary`: at most `limit` bytes of it, state as in bounded_output."""
+    argv = ["wl-paste", "--no-newline", "--type", "text"]
+    if primary:
+        argv.append("--primary")
+    data, state = bounded_output(argv, limit, CLIPBOARD_WAIT)
+    # "ignore" also drops a character the limit cut in half.
+    return data.decode("utf-8", "ignore"), state
+
+
+def paste(primary=False):
+    """Clipboard text for a text box in the panel. Qt is never asked for it:
+    it would read on the shell's GUI thread with no limit of either kind."""
+    text, state = clipboard_text(MAX_REPLY * 4, primary)
+    if state == "timeout":
+        return {"ok": False, "message": "The clipboard did not answer"}
+    if state == "error":
+        return {"ok": False, "message": "wl-paste is not available"}
+    return {"ok": True, "text": clean(text, MAX_REPLY, multiline=True)}
+
+
 def clipboard_files():
     """Paths of files copied in a file manager (text/uri-list on the clipboard)."""
-    try:
-        types = subprocess.run(["wl-paste", "--list-types"], capture_output=True,
-                               text=True, timeout=2).stdout.split()
-        mime = "text/uri-list" if "text/uri-list" in types else (
-            "x-special/gnome-copied-files" if "x-special/gnome-copied-files" in types else None)
-        if not mime:
-            return []
-        raw = subprocess.run(["wl-paste", "--no-newline", "--type", mime],
-                             capture_output=True, text=True, timeout=2).stdout
-    except (OSError, subprocess.SubprocessError):
+    types = clipboard_types()
+    mime = "text/uri-list" if "text/uri-list" in types else (
+        "x-special/gnome-copied-files" if "x-special/gnome-copied-files" in types else None)
+    if not mime:
+        return []
+    data, state = bounded_output(["wl-paste", "--no-newline", "--type", mime],
+                                 MAX_CLIPBOARD, CLIPBOARD_WAIT)
+    if state != "eof":
         return []
     paths = []
-    for line in raw[:MAX_CLIPBOARD].splitlines():
+    for line in data.decode("utf-8", "replace").splitlines():
         line = line.strip()
         if line.startswith("file://"):
             p = urllib.parse.unquote(urllib.parse.urlparse(line).path)
-            if "\0" not in p and len(p) <= MAX_PATH and os.path.isfile(p):
+            # Plain files only: a link could name one file and send another.
+            if "\0" not in p and len(p) <= MAX_PATH and os.path.isfile(p) and not os.path.islink(p):
                 paths.append(p)
         if len(paths) >= MAX_FILES:
             break
     return paths
 
 
-def latest_screenshot():
-    d = os.environ.get("OMARCHY_SCREENSHOT_DIR")
-    if not d:
+def screenshot_folders():
+    """(folder, dedicated) pairs to look for screenshots in. Omarchy saves them
+    to OMASNAP_SCREENSHOT_DIR, else the older OMARCHY_SCREENSHOT_DIR, else
+    Pictures/Screenshots. `dedicated` is False for Pictures itself, which
+    older versions used and which also holds photos."""
+    for name in ("OMASNAP_SCREENSHOT_DIR", "OMARCHY_SCREENSHOT_DIR"):
+        folder = os.environ.get(name)
+        if folder and os.path.isabs(folder):
+            return [(folder, True)]
+    data, state = bounded_output(["xdg-user-dir", "PICTURES"], MAX_PATH, 2.0)
+    pictures = data.decode("utf-8", "replace").strip() if state == "eof" else ""
+    if not os.path.isabs(pictures):
+        pictures = os.path.expanduser("~/Pictures")
+    return [(os.path.join(pictures, "Screenshots"), True), (pictures, False)]
+
+
+def latest_screenshot(folders=None):
+    """The newest screenshot, or None. In a folder that also holds other
+    pictures only files named like a screenshot count, so a private photo is
+    never picked; links are not followed, so a name cannot point elsewhere."""
+    best, newest = None, -1.0
+    for folder, dedicated in (screenshot_folders() if folders is None else folders):
+        wanted = IMAGE_NAME if dedicated else SCREENSHOT_NAME
         try:
-            d = subprocess.run(["xdg-user-dir", "PICTURES"], capture_output=True,
-                               text=True, timeout=2).stdout.strip()
-        except (OSError, subprocess.SubprocessError):
-            d = ""
-        d = d or os.path.expanduser("~/Pictures")
-    best = None
-    try:
-        for e in os.scandir(d):
-            if e.is_file() and e.name.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
-                if best is None or e.stat().st_mtime > best.stat().st_mtime:
-                    best = e
-    except OSError:
-        return None
-    return best.path if best else None
+            with os.scandir(folder) as entries:
+                for e in entries:
+                    if not wanted.match(e.name) or not e.is_file(follow_symlinks=False):
+                        continue
+                    modified = e.stat(follow_symlinks=False).st_mtime
+                    if modified > newest:
+                        best, newest = e.path, modified
+        except OSError:
+            continue
+    return best
 
 
 def send(paths):
@@ -616,14 +728,6 @@ def send(paths):
     return {"ok": True, "message": "Sending %s%s" % (names, more)}
 
 
-def clipboard_types():
-    try:
-        return subprocess.run(["wl-paste", "--list-types"], capture_output=True,
-                              text=True, timeout=2).stdout.split()
-    except (OSError, subprocess.SubprocessError):
-        return []
-
-
 def send_clipboard():
     # clipboard_send answers with tetherd's cached text, which stays empty until
     # the selection changes while the daemon runs (e.g. right after a restart).
@@ -635,15 +739,13 @@ def send_clipboard():
     r = simple({"command": "clipboard_send"}, {"clipboard_content"})
     if r.get("content"):
         return {"ok": True, "message": "Clipboard sent to iPhone"}
-    try:
-        text = subprocess.run(["wl-paste", "--no-newline", "--type", "text"],
-                              capture_output=True, text=True, timeout=2).stdout
-    except (OSError, subprocess.SubprocessError):
-        text = ""
+    text, state = clipboard_text(MAX_CLIPBOARD)
+    if state == "limit":
+        return {"ok": False, "message": "Clipboard text is too large to send"}
+    if state == "timeout":
+        return {"ok": False, "message": "The clipboard did not answer"}
     if not text:
         return {"ok": False, "message": "Clipboard is empty"}
-    if len(text) > MAX_CLIPBOARD:
-        return {"ok": False, "message": "Clipboard text is too large to send"}
     d = Daemon()
     try:
         d.request({"command": "clipboard_set", "content": text}, want=None, deadline=3.0)
@@ -727,10 +829,14 @@ def notification_text(req):
     among the notifications this widget has."""
     kind = req.get("kind")
     if kind == "pairing":
-        name = clean(req.get("name"), MAX_NAME) or "A device"
-        return ("pair-" + want_fingerprint(req.get("fingerprint")), 10.0,
-                "iPhone wants to pair",
-                "%s is asking to pair with Tether. Open the bar widget to accept." % name,
+        # Any device on the network can ask, under any name, as often as it
+        # likes: the wording claims nothing about who it is, and one key for
+        # all requests means one notification per half minute at most.
+        want_fingerprint(req.get("fingerprint"))
+        name = clean(req.get("name"), MAX_NAME)
+        who = 'A device calling itself "%s"' % name if name else "A device"
+        return ("pairing", 30.0, "Pairing request",
+                "%s asks to pair with Tether. Open the phone panel to check it." % who,
                 "/usr/share/icons/Adwaita/symbolic/devices/phone-symbolic.svg", [], None)
     if kind == "call":
         name = clean(req.get("name"), MAX_NAME)
@@ -766,7 +872,11 @@ def notify(req):
     # The body is markup where the server says so; the summary never is.
     if "body-markup" in call("GetCapabilities", None, GLib.VariantType("(as)")).unpack()[0]:
         body = html.escape(body, quote=False)
-    hints = {} if urgency is None else {"urgency": GLib.Variant("y", urgency)}
+    # Transient: a caller's name and number, or a name a stranger chose, are
+    # shown but not written to the notification history on disk.
+    hints = {"transient": GLib.Variant("b", True)}
+    if urgency is not None:
+        hints["urgency"] = GLib.Variant("y", urgency)
     shown = {"id": 0}
     loop = GLib.MainLoop()
 
@@ -842,8 +952,11 @@ def watch():
                     obj = json.loads(line)
                 except ValueError:
                     continue
-                if isinstance(obj, dict) and obj.get("command") in WATCHED_EVENTS:
-                    print(obj["command"], flush=True)
+                except RecursionError:
+                    continue
+                command = obj.get("command") if isinstance(obj, dict) else None
+                if isinstance(command, str) and command in WATCHED_EVENTS:
+                    print(command, flush=True)
     finally:
         d.close()
 
@@ -885,7 +998,7 @@ def handle(req):
         shot = latest_screenshot()
         return send([shot]) if shot else {"ok": False, "message": "No screenshot found"}
     if cmd == "messages":
-        return messages(want_thread(req.get("thread")))
+        return messages(want_thread(req.get("thread")), req.get("mark") is True)
     if cmd == "reply":
         return reply(want_thread(req.get("thread")), req.get("body"))
     if cmd == "contacts":
@@ -904,6 +1017,8 @@ def handle(req):
         if out["ok"]:
             out["message"] = "Answered — audio stays on the iPhone" if cmd == "answer" else "Call ended"
         return out
+    if cmd == "paste":
+        return paste(req.get("primary") is True)
     if cmd == "notify":
         return notify(req)
     if cmd == "show-file":
@@ -923,7 +1038,8 @@ def main(argv):
     if cmd == "watch":
         try:
             watch()
-        except OSError:
+        except Exception:
+            # No traceback here either; the widget starts it again.
             pass
         return 0
     try:

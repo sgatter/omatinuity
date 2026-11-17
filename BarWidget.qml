@@ -95,13 +95,13 @@ BarWidget {
       if (!tether.validThread(thread) || !panelLoader.item) return "no thread"
       var info = tether.threadFor(thread)
       root.open()
-      panelLoader.item.openConversation(thread, info ? info.name : thread.replace(/^tel:/, ""))
+      panelLoader.item.openConversation(thread, info ? info.name : "", info ? info.number : "")
       return "ok"
     }
     function openLatest(): string {
       if (tether.threads.length === 0 || !panelLoader.item) return "no conversations"
       root.open()
-      panelLoader.item.openConversation(tether.threads[0].thread, tether.threads[0].name)
+      panelLoader.item.openConversation(tether.threads[0].thread, tether.threads[0].name, tether.threads[0].number)
       return "ok"
     }
   }

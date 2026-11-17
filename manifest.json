@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.sgatter.omatinuity",
   "name": "Omatinuity",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "author": "sven",
   "license": "MIT",
   "description": "iPhone continuity in the Omarchy bar via Tether: messages and replies, calls, contacts, pairing, and sending files and clipboard to the phone.",

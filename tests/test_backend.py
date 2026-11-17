@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -29,7 +30,7 @@ ALLOWED_COMMANDS = {
     'backend.concat(["status"])',
     'backend.concat(["request"])',
     'root.backend.concat(["watch"])',
-    '["wl-copy"]',
+    '["wl-copy", "--type", "text/plain"]',
     '["systemctl", "--user", on ? "start" : "stop", "tetherd.service"]',
     '["sh", "-c", "uwsm-app -- nautilus \\"$(xdg-user-dir DOWNLOAD)\\""]',
     '["uwsm-app", "--", "tether-gtk"]',
@@ -95,8 +96,12 @@ class Requests(unittest.TestCase):
     def test_validators(self):
         self.assertEqual(backend.want_number("+41 76 123 45 67"), "+41 76 123 45 67")
         self.assertEqual(backend.want_number("‪+1 (555) 123-4567‬"), "+1 (555) 123-4567")
-        self.assertEqual(backend.want_number("*100#"), "*100#")
-        for bad in ("", "abc", "1; rm -rf ~", "$(id)", "1" * 41, None, 5, ["1"]):
+        self.assertEqual(backend.want_number("(044) 123 45 67"), "(044) 123 45 67")
+        self.assertEqual(backend.want_number("112"), "112")
+        # Service codes and tones sent after connecting are not dialed: the
+        # number usually comes from the phone, not from the keyboard.
+        for bad in ("*100#", "*21*0900123456#", "#31#0441234567", "0441234567,,1234", "044p123", "044w1", "044;1",
+                    "", "abc", "1; rm -rf ~", "$(id)", "1" * 41, "+", "5", None, 5, ["1"]):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 backend.want_number(bad)
         self.assertEqual(backend.want_thread("sender:sunrise"), "sender:sunrise")
@@ -113,7 +118,9 @@ class Requests(unittest.TestCase):
         for bad in ("", "short", "a b c d e f g h", "x" * 129, None):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 backend.want_fingerprint(bad)
-        for bad in ([], "file", ["a\0b"], [5], ["x"] * (backend.MAX_FILES + 1)):
+        self.assertEqual(backend.want_paths(["/tmp/a b.txt"]), ["/tmp/a b.txt"])
+        for bad in ([], "file", ["/a\0b"], [5], ["notes.txt"], ["./notes.txt"], ["~/notes.txt"],
+                    ["/x"] * (backend.MAX_FILES + 1)):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 backend.want_paths(bad)
 
@@ -233,7 +240,8 @@ class DaemonBounds(unittest.TestCase):
                 pass
 
     def test_reply_lines_that_are_not_objects_are_skipped(self):
-        d = self.fake(b'OK\n[1,2]\nnot json\n{"command": "other"}\n{"command": "wanted", "v": 1}\n')
+        d = self.fake(b'OK\n[1,2]\nnot json\n{"command": "other"}\n{"command": []}\n{"command": {"a": 1}}\n'
+                      b'{"command": "wanted", "v": 1}\n')
         d.send = lambda payload: None
         self.assertEqual(d.request({"command": "x"}, want={"wanted"})["v"], 1)
 
@@ -293,6 +301,322 @@ class NotificationText(unittest.TestCase):
         for req in ({"kind": "call", "path": "nope"}, {"kind": "pairing", "fingerprint": "x"}, {"kind": "other"}):
             with self.assertRaises(ValueError, msg=repr(req)):
                 backend.notification_text(req)
+
+
+class BoundedReads(unittest.TestCase):
+    """Whoever owns the clipboard feeds wl-paste; nothing read from it may be
+    unbounded in size or in time."""
+
+    def child(self, code):
+        return [sys.executable, "-I", "-c", code]
+
+    def test_finished_output_comes_back_whole(self):
+        data, state = backend.bounded_output(self.child("print('hello', end='')"), 100, 5.0)
+        self.assertEqual((data, state), (b"hello", "eof"))
+
+    def test_endless_output_stops_at_the_limit(self):
+        started = time.monotonic()
+        data, state = backend.bounded_output(
+            self.child("import sys\nwhile True: sys.stdout.buffer.write(b'x' * 65536)"), 200000, 30.0)
+        self.assertEqual(state, "limit")
+        self.assertEqual(len(data), 200000)
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_a_silent_owner_cannot_keep_it_waiting(self):
+        started = time.monotonic()
+        data, state = backend.bounded_output(self.child("import time\ntime.sleep(60)"), 100, 0.3)
+        self.assertEqual((data, state), (b"", "timeout"))
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_a_trickle_cannot_renew_the_wait(self):
+        # A byte every 50 ms would reset a per-read timeout forever.
+        started = time.monotonic()
+        data, state = backend.bounded_output(self.child(
+            "import sys, time\nwhile True:\n    sys.stdout.buffer.write(b'x'); sys.stdout.buffer.flush(); time.sleep(0.05)"),
+            1000, 0.5)
+        self.assertEqual(state, "timeout")
+        self.assertLess(len(data), 100)
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_a_missing_program_is_an_error_not_a_crash(self):
+        self.assertEqual(backend.bounded_output(["/nonexistent/wl-paste"], 10, 1.0), (b"", "error"))
+
+    def test_the_clipboard_is_only_read_through_the_bounded_reader(self):
+        source = (ROOT / "backend.py").read_text()
+        self.assertNotIn("capture_output=True, text=True, timeout=2).stdout\n    except", source.split("def latest_screenshot")[0])
+        for line in source.splitlines():
+            if '"wl-paste"' in line:
+                self.assertNotIn("subprocess.", line, line)
+        self.assertGreaterEqual(source.count("bounded_output(["), 2)
+
+    def paste_with(self, data, state):
+        seen = []
+        real = backend.bounded_output
+        backend.bounded_output = lambda argv, limit, wait: (seen.append((argv, limit)) or (data[:limit], state))
+        try:
+            return backend.handle({"cmd": "paste", "primary": bool(seen)}), seen
+        finally:
+            backend.bounded_output = real
+
+    def test_paste_is_bounded_and_cleaned(self):
+        out, seen = self.paste_with(("hi \x00\x1b[31m" + MARKUP + "\n" + "x" * 50000).encode(), "limit")
+        self.assertTrue(out["ok"])
+        self.assertLessEqual(len(out["text"]), backend.MAX_REPLY)
+        self.assertNotIn("\x00", out["text"])
+        self.assertNotIn("\x1b", out["text"])
+        self.assertIn(MARKUP, out["text"])
+        self.assertEqual(seen[0][1], backend.MAX_REPLY * 4)
+        self.assertEqual(seen[0][0][0], "wl-paste")
+
+    def test_paste_survives_a_character_cut_in_half(self):
+        out, _ = self.paste_with("gr\u00fc\u00df".encode()[:-1], "limit")
+        self.assertEqual(out, {"ok": True, "text": "gr\u00fc"})
+
+    def test_paste_reports_an_owner_that_does_not_answer(self):
+        out, _ = self.paste_with(b"partial", "timeout")
+        self.assertFalse(out["ok"])
+        self.assertNotIn("text", out)
+
+    def test_primary_selection_is_asked_for_only_when_requested(self):
+        seen = []
+        real = backend.bounded_output
+        backend.bounded_output = lambda argv, limit, wait: (seen.append(argv) or (b"", "eof"))
+        try:
+            backend.handle({"cmd": "paste"})
+            backend.handle({"cmd": "paste", "primary": True})
+            backend.handle({"cmd": "paste", "primary": "yes"})
+        finally:
+            backend.bounded_output = real
+        self.assertEqual(["--primary" in argv for argv in seen], [False, True, False])
+
+
+class TextBoxes(unittest.TestCase):
+    """No text box may let Qt read the clipboard on the shell's GUI thread:
+    no TextInput-based element at all, and the one writable TextEdit is
+    TextEntry's, which takes paste away from Qt (tests/tst_textentry.qml)."""
+
+    def code(self, qml):
+        return "\n".join(line.split("//")[0] for line in qml.read_text().splitlines())
+
+    def test_no_textinput_based_element(self):
+        for qml in ROOT.glob("*.qml"):
+            for name in ("TextField", "TextInput", "TextArea", "SpinBox", "ComboBox", "SearchField"):
+                self.assertNotRegex(self.code(qml), r"\b%s\b" % name, "%s uses %s" % (qml.name, name))
+
+    def test_the_only_writable_textedit_is_textentry(self):
+        writable = []
+        for qml in ROOT.glob("*.qml"):
+            lines = self.code(qml).splitlines()
+            for i, line in enumerate(lines):
+                if not re.match(r"\s*TextEdit \{$", line):
+                    continue
+                depth, block = 0, []
+                for inner in lines[i:]:
+                    block.append(inner)
+                    depth += inner.count("{") - inner.count("}")
+                    if depth <= 0:
+                        break
+                if not re.search(r"^\s*readOnly: true$", "\n".join(block), re.M):
+                    writable.append(qml.name)
+        self.assertEqual(writable, ["TextEntry.qml"])
+
+    def test_nothing_calls_qt_paste(self):
+        for qml in ROOT.glob("*.qml"):
+            code = self.code(qml)
+            self.assertNotRegex(code, r"\.paste\(\)", qml.name)
+            self.assertNotIn("canPaste", code, qml.name)
+
+    def test_textentry_needs_nothing_but_qtquick(self):
+        imports = [l for l in (ROOT / "TextEntry.qml").read_text().splitlines() if l.startswith("import ")]
+        self.assertEqual(imports, ["import QtQuick"])
+
+
+class InvisibleText(unittest.TestCase):
+    """A name or label must not look empty, or like another one, by using
+    characters that draw nothing."""
+
+    def test_one_line_text_has_no_invisible_characters(self):
+        self.assertEqual(backend.clean("Ma\u200bya\U000e0041", 50), "Maya")
+        self.assertEqual(backend.clean("\u200b\u200b", 50), "")
+        self.assertEqual(backend.clean("\u3164\u3164", 50), "")
+        self.assertEqual(backend.clean("a\x85b\u2028c", 50), "a b c")
+
+    def test_joiners_and_message_bodies_are_left_alone(self):
+        family = "\U0001f468\u200d\U0001f467"
+        self.assertEqual(backend.clean(family, 50), family)
+        self.assertEqual(backend.clean("soft\xadhyphen", 50, multiline=True), "soft\xadhyphen")
+        self.assertEqual(backend.clean("a\u2028b", 50, multiline=True), "a" + chr(10) + "b")
+
+    def test_a_contact_label_is_cleaned_while_its_address_is_kept(self):
+        raw = "tel:\u202a+1 555\u202c"
+        real = backend.simple
+        backend.simple = lambda payload, want: {"contacts": [{"name": "", "addresses": [raw, "email:a@example.org"]}]}
+        try:
+            out = backend.contacts("x")["contacts"]
+        finally:
+            backend.simple = real
+        self.assertEqual(out[0]["address"], raw)
+        self.assertEqual(out[0]["label"], "+1 555")
+        self.assertEqual(out[0]["name"], "+1 555")
+        self.assertEqual(out[1]["label"], "a@example.org")
+
+    def test_the_panel_shows_labels_never_raw_keys(self):
+        panel = (ROOT / "Panel.qml").read_text()
+        self.assertNotIn("openThread.substring(4) :", panel)
+        self.assertNotIn("String(name || thread", panel)
+        self.assertNotIn("replace(/^(tel|email):/", panel)
+        self.assertNotIn('thread.replace(/^tel:/', (ROOT / "BarWidget.qml").read_text())
+
+
+class Screenshots(unittest.TestCase):
+    """"Send latest screenshot" sends a screenshot: not the newest photo in
+    Pictures, and not what a link points to."""
+
+    def setUp(self):
+        self.pictures = pathlib.Path(tempfile.mkdtemp())
+        self.shots = self.pictures / "Screenshots"
+        self.shots.mkdir()
+        self.clock = 1_700_000_000
+
+    def put(self, path, link=None):
+        if link:
+            path.symlink_to(link)
+        else:
+            path.write_bytes(b"x")
+            self.clock += 10
+            os.utime(path, (self.clock, self.clock))
+        return str(path)
+
+    def folders(self):
+        return [(str(self.shots), True), (str(self.pictures), False)]
+
+    def test_a_newer_photo_in_pictures_is_not_a_screenshot(self):
+        shot = self.put(self.shots / "capture.png")
+        self.put(self.pictures / "IMG_2041.jpg")
+        self.put(self.pictures / "passport-scan.png")
+        self.assertEqual(backend.latest_screenshot(self.folders()), shot)
+
+    def test_pictures_itself_counts_only_for_screenshot_names(self):
+        self.put(self.pictures / "holiday.png")
+        old = self.put(self.pictures / "screenshot-2026-11-17_20-31-05.png")
+        self.put(self.pictures / "notes.txt")
+        self.assertEqual(backend.latest_screenshot(self.folders()), old)
+        newer = self.put(self.pictures / "Screenshot from 2026-11-18.jpeg")
+        self.assertEqual(backend.latest_screenshot(self.folders()), newer)
+
+    def test_links_are_not_followed(self):
+        secret = self.put(self.pictures / "private.png")
+        self.put(self.shots / "screenshot-link.png", link=secret)
+        self.put(self.pictures / "screenshot-other.png", link="/etc/hostname")
+        self.assertIsNone(backend.latest_screenshot(self.folders()))
+
+    def test_nothing_there(self):
+        self.assertIsNone(backend.latest_screenshot([("/nonexistent/folder", True)]))
+        self.assertIsNone(backend.latest_screenshot(self.folders()))
+
+    def test_omarchys_own_folder_setting_wins(self):
+        keep = {k: os.environ.pop(k, None) for k in ("OMASNAP_SCREENSHOT_DIR", "OMARCHY_SCREENSHOT_DIR")}
+        try:
+            os.environ["OMARCHY_SCREENSHOT_DIR"] = "/old/place"
+            self.assertEqual(backend.screenshot_folders(), [("/old/place", True)])
+            os.environ["OMASNAP_SCREENSHOT_DIR"] = "/new/place"
+            self.assertEqual(backend.screenshot_folders(), [("/new/place", True)])
+            os.environ["OMASNAP_SCREENSHOT_DIR"] = "relative/place"
+            self.assertEqual(backend.screenshot_folders(), [("/old/place", True)])
+        finally:
+            for k, v in keep.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_copied_files_must_be_plain_files(self):
+        real = self.put(self.pictures / "report.pdf")
+        self.put(self.pictures / "link.pdf", link=real)
+        listing = ("file://%s" + chr(10) + "file://%s" + chr(10) + "file:///nonexistent/x") % (
+            real, self.pictures / "link.pdf")
+        answers = {"--list-types": b"text/uri-list", "--no-newline": listing.encode()}
+        keep = backend.bounded_output
+        backend.bounded_output = lambda argv, limit, wait: (answers[argv[1]], "eof")
+        try:
+            self.assertEqual(backend.clipboard_files(), [real])
+        finally:
+            backend.bounded_output = keep
+
+
+class Pairing(unittest.TestCase):
+    """Any device on the network can ask to pair, under any name. Nothing
+    pairs on one key or one click, and nothing says who is asking."""
+
+    def test_the_notification_claims_nothing_about_the_device(self):
+        text = lambda **req: backend.notification_text(dict(kind="pairing", fingerprint="ab" * 16, **req))
+        key, window, summary, body, icon, actions, urgency = text(name="Alex's iPhone")
+        self.assertEqual(summary, "Pairing request")
+        self.assertTrue(body.startswith('A device calling itself "Alex' + "'" + 's iPhone" asks to pair'))
+        self.assertNotIn("iPhone wants", summary + body)
+        self.assertEqual(actions, [])
+        self.assertTrue(text()[3].startswith("A device asks to pair"))
+
+    def test_requests_cannot_flood_notifications_or_lock_files(self):
+        first = backend.notification_text({"kind": "pairing", "fingerprint": "ab" * 16})
+        second = backend.notification_text({"kind": "pairing", "fingerprint": "cd" * 16})
+        self.assertEqual(first[0], second[0])
+        self.assertGreaterEqual(first[1], 30)
+
+    def test_accepting_takes_two_separate_steps(self):
+        panel = (ROOT / "Panel.qml").read_text()
+        self.assertEqual(panel.count("tether.accept("), 1)
+        confirm = panel.split("function confirmPairing(fingerprint) {")[1].split("}")[0]
+        self.assertIn("tether.accept(fingerprint)", confirm)
+        self.assertIn("pairingToConfirm !== String(fingerprint)", confirm)
+        self.assertIn("tooSoon()", confirm)
+        self.assertNotRegex(panel, r'k === "a" && root' + chr(92) + '.hasPending')
+        self.assertIn('if (kind === "pending") togglePairing(data.fingerprint)', panel)
+        self.assertNotIn("accept", (ROOT / "BarWidget.qml").read_text().split("ShellIpc {")[1].split("BarIconButton")[0])
+
+    def test_a_wifi_pairing_is_not_renamed_after_the_bluetooth_phone(self):
+        source = (ROOT / "backend.py").read_text()
+        self.assertNotIn('["devices"][0]["name"] = result["phone_name"]', source)
+        self.assertNotIn("viaBluetooth", (ROOT / "Panel.qml").read_text())
+
+    def test_notifications_are_not_kept_in_history(self):
+        self.assertIn('hints = {"transient": GLib.Variant("b", True)}', (ROOT / "backend.py").read_text())
+
+
+class OtherFiles(unittest.TestCase):
+    def test_setup_script(self):
+        script = ROOT / "setup-bluetooth.sh"
+        self.assertEqual(subprocess.run(["bash", "-n", str(script)]).returncode, 0)
+        text = script.read_text()
+        lines = [line.strip() for line in text.splitlines()]
+        ask = lines.index('read -r -p "Continue? [y/N] " answer')
+        changing = ("sudo ", "systemctl --user restart", "cat > ", "tether bt calls-enable", "mkdir ", "printf '[Service]")
+        first = min(i for i, line in enumerate(lines) if line.startswith(changing))
+        self.assertGreater(first, ask, "%r runs before the question" % lines[first])
+        # Every file it writes is behind an "already there" check.
+        self.assertLess(text.index('elif [[ -e $dropin ]]'), text.index('sudo tee "$dropin"'))
+        self.assertLess(text.index('elif [[ -e $roles_file ]]'), text.index('cat > "$roles_file"'))
+        answered_no = subprocess.run(["bash", str(script)], input="n" + chr(10), capture_output=True, text=True)
+        if os.geteuid() != 0:
+            self.assertEqual(answered_no.returncode, 0)
+            self.assertTrue(answered_no.stdout.rstrip().endswith("Nothing changed."))
+
+    def test_the_redirect_folder_holds_one_program(self):
+        self.assertEqual(sorted(p.name for p in (ROOT / "bin").iterdir()), ["tether-gtk"])
+        shim = (ROOT / "bin" / "tether-gtk").read_text()
+        self.assertIn("exec /usr/bin/tether-gtk", shim)
+        self.assertIn("[[:cntrl:]]", shim)
+
+    def test_read_marks_follow_the_user_not_the_daemon(self):
+        self.assertFalse(backend.handle.__code__.co_consts is None)
+        service = (ROOT / "Service.qml").read_text()
+        self.assertIn('{ cmd: "messages", thread: openThread, mark: _markRead }', service)
+        self.assertEqual(service.count("_markRead = true"), 2)
+        source = (ROOT / "backend.py").read_text()
+        self.assertIn("if mark and unread:", source)
+        self.assertIn('req.get("mark") is True', source)
+
+    def test_an_error_reply_is_not_taken_for_a_status(self):
+        self.assertIn('typeof s.installed !== "boolean"', (ROOT / "Service.qml").read_text())
 
 
 if __name__ == "__main__":

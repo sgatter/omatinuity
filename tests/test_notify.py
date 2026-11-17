@@ -125,7 +125,10 @@ def inside():
     check(json.loads(first[-1]) == {"ok": True, "shown": True}, "first pairing %r" % first)
     check(json.loads(second[-1]) == {"ok": True, "shown": False}, "second pairing %r" % second)
     check(len(seen["notify"]) == 4, "pairing shown %d times" % (len(seen["notify"]) - 3))
-    check(seen["notify"][3][4].startswith("Phone &lt;i&gt;x&lt;/i&gt; is asking"), "pairing body")
+    check(seen["notify"][3][3] == "Pairing request", "pairing summary")
+    check(seen["notify"][3][4].startswith('A device calling itself "Phone &lt;i&gt;x&lt;/i&gt;" asks to pair'), "pairing body")
+    # Shown, but kept out of the notification history on disk.
+    check(all(n[6].get("transient") is True for n in seen["notify"]), "a notification is not transient")
     shutil.rmtree(env["XDG_RUNTIME_DIR"], ignore_errors=True)
     sys.exit(0)
 

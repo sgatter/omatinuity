@@ -80,7 +80,7 @@ Panel {
   readonly property var actions: [
     { id: "clip", glyph: 0xF018F, title: "Send clipboard", detail: "Push the current clipboard text to the iPhone" },
     { id: "files", glyph: 0xF0214, title: "Send copied files", detail: "Copy files in Nautilus (Ctrl+C), then send them" },
-    { id: "shot", glyph: 0xF0E51, title: "Send latest screenshot", detail: "The newest image in your screenshots folder" },
+    { id: "shot", glyph: 0xF0E51, title: "Send latest screenshot", detail: "The newest one in your screenshots folder" },
     { id: "downloads", glyph: 0xF024D, title: "Open Downloads", detail: "Where files from the iPhone land" },
     { id: "app", glyph: 0xF03CC, title: "Open Tether", detail: "Notifications, settings and the full app" }
   ]
@@ -97,7 +97,13 @@ Panel {
     }
     if (view === "thread") return out
     for (i = 0; i < tether.calls.length; i++) out.push({ kind: "call", data: tether.calls[i] })
-    for (i = 0; i < tether.pending.length; i++) out.push({ kind: "pending", data: tether.pending[i] })
+    for (i = 0; i < tether.pending.length; i++) {
+      out.push({ kind: "pending", data: tether.pending[i] })
+      if (pairingToConfirm !== "" && String(tether.pending[i].fingerprint) === pairingToConfirm) {
+        out.push({ kind: "pairyes", data: tether.pending[i] })
+        out.push({ kind: "pairno", data: tether.pending[i] })
+      }
+    }
     if (tether.active && btSetUp) {
       out.push({ kind: "compose", data: null })
       for (i = 0; i < tether.threads.length; i++) out.push({ kind: "thread", data: tether.threads[i] })
@@ -114,8 +120,51 @@ Panel {
   readonly property string dialNumber: /^[+0-9][0-9 ()\-.]{2,}$/.test(dialQuery.trim()) ? dialQuery.trim().replace(/[ ()\-.]/g, "") : ""
 
   readonly property var openThreadInfo: tether.threadFor(tether.openThread)
-  readonly property string openThreadName: openThreadInfo ? String(openThreadInfo.name) : threadTitleOverride
+  // Titles are names and cleaned labels from the helper, never a raw thread key.
+  readonly property string openThreadName: openThreadInfo ? String(openThreadInfo.name)
+    : (threadTitleOverride !== "" ? threadTitleOverride : "Conversation")
+  readonly property string openThreadLabel: openThreadInfo
+    ? (openThreadInfo.number !== "" ? String(openThreadInfo.number) : (openThreadInfo.group ? "Group" : ""))
+    : threadLabelOverride
   property string threadTitleOverride: ""
+  property string threadLabelOverride: ""
+  // The conversation the text in the reply box was written for.
+  property string draftThread: ""
+
+  // Pairing hands a device the clipboard, file transfer and more, and any
+  // device on the network can ask, under any name. So one key or one click
+  // never pairs: the first only opens the request, with its whole fingerprint;
+  // pairing is a second, separate row.
+  property string pairingToConfirm: ""
+
+  // Calls and pairing requests appear above everything else and push the
+  // other rows down. For a moment after that, nothing they offer can be
+  // triggered, and Enter does nothing until the cursor is moved again, so a
+  // key or click meant for the row that was there cannot answer or pair.
+  readonly property int topRows: tether.calls.length + tether.pending.length
+  property double topRowsAt: 0
+  onTopRowsChanged: {
+    topRowsAt = Date.now()
+    cursorActive = false
+  }
+  function tooSoon() { return Date.now() - topRowsAt < 800 }
+
+  function rowIndexOf(kind, fingerprint) {
+    for (var i = 0; i < rows.length; i++)
+      if (rows[i].kind === kind && rows[i].data && String(rows[i].data.fingerprint) === String(fingerprint)) return i
+    return -1
+  }
+
+  function togglePairing(fingerprint) {
+    if (tooSoon()) return
+    pairingToConfirm = pairingToConfirm === String(fingerprint) ? "" : String(fingerprint)
+  }
+
+  function confirmPairing(fingerprint) {
+    if (tooSoon() || pairingToConfirm !== String(fingerprint)) return
+    pairingToConfirm = ""
+    tether.accept(fingerprint)
+  }
 
   function glyph(cp) { return String.fromCodePoint(cp) }
 
@@ -161,18 +210,22 @@ Panel {
   }
 
   function activateRow(kind, data) {
-    if (kind === "pending") tether.accept(data.fingerprint)
+    if (kind === "pending") togglePairing(data.fingerprint)
+    else if (kind === "pairyes") confirmPairing(data.fingerprint)
+    else if (kind === "pairno") pairingToConfirm = ""
     else if (kind === "received") tether.openFile(data)
     else if (kind === "action") runAction(data.id)
-    else if (kind === "call") data.ringing && !data.outgoing ? tether.answer(data.path) : tether.hangup(data.path)
-    else if (kind === "thread") openConversation(data.thread, data.name)
+    else if (kind === "call") {
+      if (!tooSoon()) data.ringing && !data.outgoing ? tether.answer(data.path) : tether.hangup(data.path)
+    }
+    else if (kind === "thread") openConversation(data.thread, data.name, data.number)
     else if (kind === "compose") openDialer()
     else if (kind === "setup") runSetup()
     else if (kind === "dialnumber") tether.dial(data.number)
     else if (kind === "history") tether.dial(data.number)
     else if (kind === "contact") {
       if (data.number && tether.callsReady) tether.dial(data.number)
-      else openConversation(data.address, data.name)
+      else openConversation(data.address, data.name, data.label)
     }
   }
 
@@ -190,8 +243,14 @@ Panel {
     root.close()
   }
 
-  function openConversation(thread, name) {
-    threadTitleOverride = String(name || thread || "")
+  function openConversation(thread, name, label) {
+    threadLabelOverride = String(label || "")
+    threadTitleOverride = String(name || label || "")
+    // A draft belongs to the conversation it was typed in.
+    if (draftThread !== String(thread)) {
+      replyField.text = ""
+      draftThread = String(thread)
+    }
     tether.openConversation(thread)
     followLatest = true
     view = "thread"
@@ -233,9 +292,15 @@ Panel {
     scrollToBottom()
   }
 
+  // Enter in the box dials only a number typed there. For a name it moves to
+  // the list, so a call is always to a row that is shown and selected: the
+  // first row may be the last caller, or a hit left from the previous search.
   function dialFromField() {
     if (dialNumber !== "") tether.dial(dialNumber)
-    else if (rows.length > 0) activateRow(rows[0].kind, rows[0].data)
+    else if (rows.length > 0) {
+      setRowCursor(0)
+      keyCatcher.forceActiveFocus()
+    }
   }
 
   function scrollCursorIntoView() {
@@ -309,9 +374,9 @@ Panel {
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   } else {
     tether.closeConversation()
+    pairingToConfirm = ""
   }
   onRowsChanged: if (rowIndex >= rows.length) rowIndex = Math.max(0, rows.length - 1)
-  onRingingChanged: if (ringing && opened && view === "main") { focusSection = "rows"; rowIndex = 0 }
 
   KeyboardPanel {
     id: panel
@@ -343,9 +408,8 @@ Panel {
         else if (k === "f") tether.sendCopiedFiles()
         else if (k === "s") tether.sendScreenshot()
         else if (k === "n" && root.btSetUp) root.openDialer()
-        else if (k === "a" && root.ringing) tether.answer(tether.ringingCall.path)
+        else if (k === "a" && root.ringing && !root.tooSoon()) tether.answer(tether.ringingCall.path)
         else if (k === "d" && tether.inCall) tether.hangup("")
-        else if (k === "a" && root.hasPending) tether.accept(tether.pending[0].fingerprint)
       }
 
       Flickable {
@@ -432,7 +496,7 @@ Panel {
             textFormat: Text.PlainText
             visible: root.view === "main" && tether.loaded && !tether.installed
             width: parent.width
-            text: "Install it with: yay -S tether, then systemctl --user enable --now tetherd"
+            text: "Install it with: yay -S tether-bin, then systemctl --user enable --now tetherd"
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
@@ -459,9 +523,9 @@ Panel {
                 secondGlyph: root.glyph(0xF03F5)
                 secondTip: incoming ? "Decline (d)" : "Hang up (d)"
                 secondColor: root.urgent
-                onActivated: incoming ? tether.answer(modelData.path) : tether.hangup(modelData.path)
-                onTrailingClicked: tether.answer(modelData.path)
-                onSecondClicked: tether.hangup(modelData.path)
+                onActivated: if (!root.tooSoon()) incoming ? tether.answer(modelData.path) : tether.hangup(modelData.path)
+                onTrailingClicked: if (!root.tooSoon()) tether.answer(modelData.path)
+                onSecondClicked: if (!root.tooSoon()) tether.hangup(modelData.path)
               }
             }
           }
@@ -471,18 +535,70 @@ Panel {
             title: "PAIRING REQUEST"
             Repeater {
               model: tether.pending
-              ActionRow {
+              Column {
+                id: request
                 required property var modelData
                 required property int index
-                flatIndex: root.rowOffset("pending") + index
-                glyphText: root.phoneGlyph
-                glyphColor: root.urgent
-                title: String(modelData.name)
-                detail: "Fingerprint " + String(modelData.fingerprint).substring(0, 23) + "…"
-                trailingGlyph: root.glyph(0xF012C)
-                trailingTip: "Accept"
-                onActivated: tether.accept(modelData.fingerprint)
-                onTrailingClicked: tether.accept(modelData.fingerprint)
+                readonly property string fingerprint: String(modelData.fingerprint)
+                readonly property bool confirming: root.pairingToConfirm === fingerprint
+                width: parent ? parent.width : 0
+                spacing: Style.spacing.labelGap
+
+                ActionRow {
+                  flatIndex: root.rowIndexOf("pending", request.fingerprint)
+                  glyphText: root.phoneGlyph
+                  glyphColor: root.urgent
+                  title: String(request.modelData.name)
+                  detail: request.confirming ? "Check it before you pair" : "Asks to pair. Open to check it."
+                  trailingGlyph: request.confirming ? root.glyph(0xF0143) : root.glyph(0xF0140)
+                  trailingTip: request.confirming ? "Close" : "Check"
+                  onActivated: root.togglePairing(request.fingerprint)
+                  onTrailingClicked: root.togglePairing(request.fingerprint)
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  visible: request.confirming
+                  width: parent.width
+                  text: "Pair only if you asked for this from your own iPhone just now. The name above is whatever the device calls itself. A paired device can read and set the clipboard, send files to Downloads and open links on this computer."
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  wrapMode: Text.WordWrap
+                  leftPadding: Style.space(10)
+                  rightPadding: Style.space(10)
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  visible: request.confirming
+                  width: parent.width
+                  text: "Fingerprint " + request.fingerprint
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  wrapMode: Text.WrapAnywhere
+                  leftPadding: Style.space(10)
+                  rightPadding: Style.space(10)
+                }
+
+                ActionRow {
+                  visible: request.confirming
+                  flatIndex: root.rowIndexOf("pairyes", request.fingerprint)
+                  glyphText: root.glyph(0xF012C)
+                  title: "Pair with this device"
+                  detail: "Stays paired until you forget it under Devices"
+                  onActivated: root.confirmPairing(request.fingerprint)
+                }
+
+                ActionRow {
+                  visible: request.confirming
+                  flatIndex: root.rowIndexOf("pairno", request.fingerprint)
+                  glyphText: root.glyph(0xF0156)
+                  title: "Not now"
+                  detail: "Leaves the request waiting; it expires by itself"
+                  onActivated: root.pairingToConfirm = ""
+                }
               }
             }
           }
@@ -526,7 +642,7 @@ Panel {
                 meta: root.formatTime(modelData.timestamp)
                 trailingGlyph: modelData.number !== "" && tether.callsReady ? root.glyph(0xF03F2) : ""
                 trailingTip: "Call"
-                onActivated: root.openConversation(modelData.thread, modelData.name)
+                onActivated: root.openConversation(modelData.thread, modelData.name, modelData.number)
                 onTrailingClicked: tether.dial(modelData.number)
               }
             }
@@ -585,18 +701,12 @@ Panel {
                 required property int index
                 flatIndex: root.rowOffset("device") + index
                 glyphText: root.phoneGlyph
-                // The Wi-Fi link is up only while the Tether app is active on
-                // the phone; Bluetooth (battery, messages, calls) stays up
-                // regardless. With one phone both links are the same device.
-                readonly property bool viaBluetooth: tether.devices.length === 1 && !!tether.bt && tether.bt.present === true
-                glyphColor: modelData.connected || viaBluetooth ? root.foreground : root.dim
+                // These are tetherd's Wi-Fi pairings, shown as what they are: a
+                // name cannot prove which of them is the Bluetooth phone.
+                glyphColor: modelData.connected ? root.foreground : root.dim
                 title: String(modelData.name)
-                detail: {
-                  var wifi = modelData.connected ? "Wi-Fi " + String(modelData.address).replace(/:\d+$/, "") : ""
-                  if (viaBluetooth && wifi !== "") return "Bluetooth · " + wifi
-                  if (viaBluetooth) return "Bluetooth · Wi-Fi when the Tether app is open"
-                  return wifi !== "" ? wifi : "Offline"
-                }
+                detail: modelData.connected ? "Wi-Fi " + String(modelData.address).replace(/:\d+$/, "")
+                  : "Paired over Wi-Fi, not connected"
                 trailingGlyph: root.glyph(0xF0A7A)
                 trailingTip: "Forget device"
                 // Forgetting is destructive, so only the trailing button does it.
@@ -649,7 +759,7 @@ Panel {
           SubHeader {
             visible: root.view === "thread"
             title: root.openThreadName
-            subtitle: tether.openThread.indexOf("tel:") === 0 ? tether.openThread.substring(4) : (root.openThreadInfo && root.openThreadInfo.group ? "Group" : "")
+            subtitle: root.openThreadLabel
             actionGlyph: tether.callsReady && tether.openThread.indexOf("tel:") === 0 ? root.glyph(0xF03F2) : ""
             actionTip: "Call"
             onActionClicked: tether.dial(tether.openThread.substring(4))
@@ -700,16 +810,15 @@ Panel {
             width: parent.width
             spacing: Style.space(8)
 
-            TextField {
+            Entry {
               id: replyField
               Layout.fillWidth: true
-              foreground: root.foreground
-              font.family: root.fontFamily
+              maxLines: 4
+              maxLength: 5000
               placeholderText: "iMessage / SMS — Enter to send, Esc to go back"
               enabled: !tether.busy
-              Keys.onReturnPressed: root.sendReply()
-              Keys.onEnterPressed: root.sendReply()
-              Keys.onEscapePressed: root.backToMain()
+              onAccepted: root.sendReply()
+              onCancelled: root.backToMain()
             }
 
             PanelActionButton {
@@ -729,22 +838,20 @@ Panel {
             subtitle: tether.callsReady ? "Calls are placed on the iPhone" : "Calling is not available yet"
           }
 
-          TextField {
+          Entry {
             id: dialField
             visible: root.view === "dial"
             width: parent.width
-            foreground: root.foreground
-            font.family: root.fontFamily
+            maxLength: 64
             placeholderText: "Name or number"
             hasCursor: root.cursorActive && root.focusSection === "header" && root.view === "dial"
             onTextChanged: {
               root.dialQuery = text
               contactSearch.restart()
             }
-            Keys.onReturnPressed: root.dialFromField()
-            Keys.onEnterPressed: root.dialFromField()
-            Keys.onEscapePressed: root.backToMain()
-            Keys.onDownPressed: {
+            onAccepted: root.dialFromField()
+            onCancelled: root.backToMain()
+            onDownRequested: {
               if (root.rows.length === 0) return
               root.setRowCursor(0)
               keyCatcher.forceActiveFocus()
@@ -791,7 +898,7 @@ Panel {
                 trailingGlyph: modelData.number !== "" ? root.glyph(0xF036A) : ""
                 trailingTip: "Message"
                 onActivated: tether.dial(modelData.number)
-                onTrailingClicked: root.openConversation("tel:" + modelData.number, modelData.name || modelData.number)
+                onTrailingClicked: root.openConversation("tel:" + modelData.number, modelData.name, modelData.number)
               }
             }
 
@@ -803,13 +910,13 @@ Panel {
                 flatIndex: root.rowOffset("contact") + index
                 glyphText: root.glyph(0xF0004)
                 title: String(modelData.name)
-                detail: String(modelData.address).replace(/^(tel|email):/, "")
+                detail: String(modelData.label || "")
                 trailingGlyph: root.glyph(0xF036A)
                 trailingTip: "Message"
                 secondGlyph: modelData.number !== "" && tether.callsReady ? root.glyph(0xF03F2) : ""
                 secondTip: "Call"
                 onActivated: root.activateRow("contact", modelData)
-                onTrailingClicked: root.openConversation(modelData.address, modelData.name)
+                onTrailingClicked: root.openConversation(modelData.address, modelData.name, modelData.label)
                 onSecondClicked: tether.dial(modelData.number)
               }
             }
@@ -837,6 +944,33 @@ Panel {
     PropertyAnimation { target: hero; property: "metaOpacity"; to: 0.0; duration: 180; easing.type: Easing.OutQuad }
     ScriptAction { script: root.phraseIndex = (root.phraseIndex + 1) % root.activePhrases.length }
     PropertyAnimation { target: hero; property: "metaOpacity"; to: 1.0; duration: 260; easing.type: Easing.InQuad }
+  }
+
+  // The look of the shell's own text field, on TextEntry; TextEntry.qml says
+  // why these boxes are built differently. Paste goes through the service.
+  component Entry: TextEntry {
+    id: entry
+    property color foreground: root.foreground
+    property bool hasCursor: false
+    readonly property bool hot: hovered || hasCursor
+    readonly property var borderSpec: Border.controlSpec(activeFocus ? "focus" : (hot ? "hover-cursor" : "normal"), foreground, root.accent)
+
+    color: foreground
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.body
+    selectionColor: Style.selectionFillFor(foreground, root.accent)
+    selectedTextColor: foreground
+    placeholderTextColor: Qt.darker(foreground, 1.6)
+    leftPadding: Style.spacing.controlPaddingX + Border.left(borderSpec)
+    rightPadding: Style.spacing.controlPaddingX + Border.right(borderSpec)
+    topPadding: Style.spacing.inputPaddingY + Border.top(borderSpec)
+    bottomPadding: Style.spacing.inputPaddingY + Border.bottom(borderSpec)
+    background: BorderSurface {
+      color: Style.controlFill(entry.activeFocus, entry.hot, entry.foreground, root.accent)
+      borderSpec: entry.borderSpec
+      radius: Style.cornerRadius
+    }
+    onPasteRequested: function(primary) { tether.paste(entry, primary) }
   }
 
   component Section: Column {

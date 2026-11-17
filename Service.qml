@@ -99,6 +99,12 @@ Item {
   function applyStatus(raw) {
     var s
     try { s = JSON.parse(raw) } catch (e) { lastError = "Could not read Tether status"; return }
+    // An error reply is not a status: taking it for one would read as
+    // "Tether is not installed".
+    if (!s || typeof s !== "object" || typeof s.installed !== "boolean") {
+      lastError = "Could not read Tether status"
+      return
+    }
     installed = s.installed === true
     unit = String(s.unit || "unknown")
     running = s.running === true
@@ -199,9 +205,22 @@ Item {
     if (t === "") return false
     copyProcess.running = false
     copyProcess.payload = t
-    copyProcess.command = ["wl-copy"]
+    // A fixed type: left to guess, wl-copy inspects the text to pick one.
+    copyProcess.command = ["wl-copy", "--type", "text/plain"]
     copyProcess.stdinEnabled = true
     copyProcess.running = true
+    return true
+  }
+
+  // Pasting into the panel's text boxes. TextEntry never lets Qt read the
+  // clipboard; the helper fetches the text instead, with a size and a time
+  // limit and outside the shell's GUI thread, and the box takes what fits.
+  property var _pasteTarget: null
+
+  function paste(target, primary) {
+    if (!target || pasteProcess.running) return false
+    _pasteTarget = target
+    submit(pasteProcess, { cmd: "paste", primary: primary === true })
     return true
   }
 
@@ -226,27 +245,40 @@ Item {
     return runAction({ cmd: "dial", number: n })
   }
 
+  // Messages are marked read on the iPhone when you open a conversation or
+  // reply in it, not by the reloads that follow daemon events: a panel left
+  // open (behind a lock screen, say) must not mark what nobody saw.
+  property bool _markRead: false
+  property string _conversationRaw: ""
+
   function openConversation(thread) {
     openThread = validThread(thread) ? String(thread) : ""
     conversation = []
+    _conversationRaw = ""
+    _markRead = true
     loadConversation()
   }
 
   function closeConversation() {
     openThread = ""
     conversation = []
+    _conversationRaw = ""
+    _markRead = false
   }
 
   function loadConversation() {
     if (openThread === "" || conversationProcess.running) return
     conversationLoading = true
-    submit(conversationProcess, { cmd: "messages", thread: openThread })
+    submit(conversationProcess, { cmd: "messages", thread: openThread, mark: _markRead })
+    _markRead = false
   }
 
   function sendReply(body) {
     var text = String(body || "")
     if (openThread === "" || text.trim() === "") return false
     if (!runAction({ cmd: "reply", thread: openThread, body: text })) return false
+    _markRead = true
+    _conversationRaw = ""
     // Show it right away; the reload after the send replaces it with the real one.
     var next = conversation.slice()
     next.push({ body: text, outgoing: true, timestamp: Math.floor(Date.now() / 1000), pending: true })
@@ -358,6 +390,20 @@ Item {
   }
 
   Request {
+    id: pasteProcess
+    stdout: StdioCollector { id: pasteStdout; waitForEnd: true }
+    onExited: function(exitCode) {
+      var r = {}
+      try { r = JSON.parse(String(pasteStdout.text || "{}")) } catch (e) { r = {} }
+      var target = root._pasteTarget
+      root._pasteTarget = null
+      // Only into the box that asked, and only while it is still being typed in.
+      if (r.ok === true && target && target.activeFocus) target.insertText(String(r.text || ""))
+      else if (r.ok !== true) root.flash(String(r.message || "Could not paste"))
+    }
+  }
+
+  Request {
     id: callNotifyProcess
     property string callPath: ""
     stdout: SplitParser {
@@ -374,10 +420,16 @@ Item {
     stdout: StdioCollector { id: conversationStdout; waitForEnd: true }
     onExited: function(exitCode) {
       root.conversationLoading = false
+      var raw = String(conversationStdout.text || "{}")
       var r = {}
-      try { r = JSON.parse(String(conversationStdout.text || "{}")) } catch (e) { r = {} }
-      if (r.ok && r.thread === root.openThread) root.conversation = r.messages || []
-      else if (!r.ok) root.flash(String(r.message || "Could not load the conversation"))
+      try { r = JSON.parse(raw) } catch (e) { r = {} }
+      if (r.ok && r.thread === root.openThread) {
+        // Unchanged since the last load: leave the bubbles as they are.
+        if (raw !== root._conversationRaw) {
+          root._conversationRaw = raw
+          root.conversation = r.messages || []
+        }
+      } else if (!r.ok) root.flash(String(r.message || "Could not load the conversation"))
     }
   }
 
